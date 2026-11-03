@@ -91,6 +91,12 @@ in
     example = [ "nixpkgs-stable" ];
     description = "Flake inputs, as named in flake.lock, that a failed package may be pinned to instead of the revision it last built with, when one has a newer version of it that is already built or in a substituter. Only for packages nothing else in the system depends on.";
   };
+  inputDeny = mkOption {
+    type = types.listOf types.str;
+    default = [ ];
+    example = [ "nix-secrets" ];
+    description = "Flake inputs never to roll back in flake.lock when they break a build, such as one holding secrets that were rotated. A trailing * matches a prefix, so [ \"*\" ] turns rolling back off.";
+  };
   retrySameDerivationAfterDays = mkOption {
     type = types.ints.unsigned;
     default = 7;

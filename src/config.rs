@@ -38,6 +38,13 @@ pub struct Config {
     /// version of it that is already built.
     #[serde(default)]
     pub donors: Vec<String>,
+    /// Flake inputs never to roll back when they break a build. A trailing *
+    /// matches a prefix, so "*" turns rolling back off.
+    #[serde(default)]
+    pub input_deny: Vec<String>,
+    /// The package sets besides `input`, never rolled back.
+    #[serde(default)]
+    pub package_sets: Vec<String>,
     /// Retry a package whose drv the update did not change only once it was
     /// last tried this many days ago; 0 retries it whenever its input moves.
     #[serde(default = "default_retry_same_after_days")]

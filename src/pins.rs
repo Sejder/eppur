@@ -116,10 +116,6 @@ pub struct Entry {
     pub held: Option<Held>,
 }
 
-fn is_zero(n: &i64) -> bool {
-    *n == 0
-}
-
 impl Entry {
     /// How recent the newest lock this entry reflects is.
     pub fn recency(&self) -> i64 {
@@ -185,6 +181,34 @@ impl Entry {
     }
 }
 
+/// A flake input held back in flake.lock, for the whole flake.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InputPin {
+    /// The flake.lock node's `locked` of the revision it is held at.
+    pub locked: Value,
+    /// The narHash of the revision that failed.
+    pub failed_nar_hash: String,
+    pub since: String,
+    pub reason: Reason,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_drv: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// The targets it failed on, e.g. "host home": a retry only counts as
+    /// passed once each of them built.
+    pub targets: Vec<String>,
+    /// The lock has a newer revision that a build is testing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub retrying: bool,
+}
+
+impl InputPin {
+    pub fn good_nar_hash(&self) -> Option<&str> {
+        self.locked["narHash"].as_str()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PinsFile {
     pub version: u32,
@@ -192,6 +216,16 @@ pub struct PinsFile {
     pub hosts: BTreeMap<String, Entry>,
     #[serde(default)]
     pub homes: BTreeMap<String, Entry>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub inputs: BTreeMap<String, InputPin>,
+    /// When `inputs` last changed, in seconds: it is one decision about one
+    /// lock, so `nixheal merge` takes the newer map whole, an emptied one too.
+    #[serde(default, rename = "inputsChanged", skip_serializing_if = "is_zero")]
+    pub inputs_changed: i64,
+}
+
+fn is_zero(n: &i64) -> bool {
+    *n == 0
 }
 
 impl Default for PinsFile {
@@ -200,6 +234,8 @@ impl Default for PinsFile {
             version: VERSION,
             hosts: BTreeMap::new(),
             homes: BTreeMap::new(),
+            inputs: BTreeMap::new(),
+            inputs_changed: 0,
         }
     }
 }
@@ -266,16 +302,53 @@ impl PinsFile {
             .chain(self.homes.iter().map(|(n, e)| (Kind::Home, n.as_str(), e)))
     }
 
+    /// Mark `inputs` as changed now. Always moves forward, so a change made
+    /// within the same second still wins a merge.
+    pub fn touch_inputs(&mut self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs() as i64);
+        self.inputs_changed = now.max(self.inputs_changed + 1);
+    }
+
+    /// Take the other file's input pins if they changed later than these.
+    /// Returns whether they were taken.
+    pub fn merge_inputs(&mut self, other: &PinsFile) -> bool {
+        if other.inputs_changed <= self.inputs_changed {
+            return false;
+        }
+        self.inputs = other.inputs.clone();
+        self.inputs_changed = other.inputs_changed;
+        true
+    }
+
     /// Put `entry` in place unless the file already holds one computed from a
     /// newer lock: how `nixheal merge` combines two files, e.g. a fleet's
     /// published pins with a checkout's. Pins made by hand here that the
     /// incoming entry lacks are kept. Returns whether the entry was taken.
-    pub fn merge(&mut self, kind: Kind, name: &str, mut entry: Entry) -> bool {
+    #[cfg(test)]
+    pub fn merge(&mut self, kind: Kind, name: &str, entry: Entry) -> bool {
+        self.merge_for_lock(kind, name, entry, None)
+    }
+
+    /// `merge` for a checkout whose flake.lock has this sha256. An entry made
+    /// for that very lock beats one that was not, even if that one looks
+    /// newer: rolling back a flake input lowers a lock's lastModified, so the
+    /// later decision can rank as the older one.
+    pub fn merge_for_lock(
+        &mut self,
+        kind: Kind,
+        name: &str,
+        mut entry: Entry,
+        lock_sha256: Option<&str>,
+    ) -> bool {
         let section = self.section_mut(kind);
         if let Some(existing) = section.get(name) {
+            let for_this_lock = lock_sha256
+                .is_some_and(|sha| entry.lock_sha256 == sha && existing.lock_sha256 != sha);
             // A tie keeps the entry here: the same lock, and a local change
             // (a clear or a retry) is deliberate.
-            if existing.recency() >= entry.recency() {
+            if existing.recency() >= entry.recency() && !for_this_lock {
                 return false;
             }
             for (input, attr, pin) in existing.iter() {
@@ -416,6 +489,72 @@ mod tests {
         assert!(PinsFile::parse(br#"{"version":3}"#).is_err());
         assert!(PinsFile::parse(br#"{"lockSha256":"x","pins":{}}"#).is_err());
         assert_eq!(PinsFile::parse(b"{}").unwrap(), PinsFile::default());
+    }
+
+    fn input_pin() -> InputPin {
+        InputPin {
+            locked: serde_json::json!({ "narHash": "sha256-good" }),
+            failed_nar_hash: "sha256-bad".into(),
+            since: "2026-11-02".into(),
+            reason: Reason::Build,
+            failed_drv: None,
+            error: None,
+            targets: vec!["host a".into()],
+            retrying: false,
+        }
+    }
+
+    #[test]
+    fn a_file_without_input_pins_serializes_as_before() {
+        let bytes = PinsFile::default().to_bytes();
+        let text = String::from_utf8(bytes.clone()).unwrap();
+        assert!(!text.contains("inputs"), "{text}");
+        assert_eq!(PinsFile::parse(&bytes).unwrap(), PinsFile::default());
+    }
+
+    #[test]
+    fn input_pins_round_trip() {
+        let mut f = PinsFile::default();
+        f.inputs.insert("atlas".into(), input_pin());
+        f.touch_inputs();
+        assert_eq!(PinsFile::parse(&f.to_bytes()).unwrap(), f);
+    }
+
+    #[test]
+    fn merge_takes_the_later_input_pins_whole() {
+        let mut here = PinsFile::default();
+        here.inputs.insert("atlas".into(), input_pin());
+        here.touch_inputs();
+
+        let mut older = PinsFile::default();
+        older.inputs.insert("other".into(), input_pin());
+        older.inputs_changed = here.inputs_changed - 1;
+        assert!(!here.merge_inputs(&older));
+        assert!(here.inputs.contains_key("atlas"));
+        assert!(!here.merge_inputs(&here.clone()));
+
+        // A later file that emptied the map, e.g. after a clear, wins.
+        let mut emptied = here.clone();
+        emptied.inputs.clear();
+        emptied.touch_inputs();
+        assert!(here.merge_inputs(&emptied));
+        assert!(here.inputs.is_empty());
+    }
+
+    #[test]
+    fn an_entry_for_the_current_lock_wins_though_it_looks_older() {
+        let mut older = entry(5);
+        older.lock_sha256 = "current".into();
+        let mut here = PinsFile::default();
+        here.set(Kind::Nixos, "laptop", entry(10));
+        assert!(!here.merge(Kind::Nixos, "laptop", older.clone()));
+        assert!(!here.merge_for_lock(Kind::Nixos, "laptop", older.clone(), Some("other")));
+        assert!(here.merge_for_lock(Kind::Nixos, "laptop", older.clone(), Some("current")));
+        assert_eq!(here.entry(Kind::Nixos, "laptop"), Some(&older));
+        // Once it is here, it is the same lock, and a local change stays.
+        let mut local = older.clone();
+        local.checked_last_modified = 1;
+        assert!(!here.merge_for_lock(Kind::Nixos, "laptop", local, Some("current")));
     }
 
     #[test]

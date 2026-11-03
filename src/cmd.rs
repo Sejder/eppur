@@ -3,12 +3,14 @@ use crate::date;
 use crate::engine::{self, Engine};
 use crate::git::Git;
 use crate::guard;
+use crate::inputs;
 use crate::lock::Lock;
 use crate::log;
 use crate::nix::{self, Nix};
 use crate::pins::{Kind, Pin, PinsFile, Reason};
 use crate::state;
 use anyhow::{Context, Result, anyhow, bail};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
@@ -573,6 +575,83 @@ fn tally(changes: &[String]) -> String {
     }
 }
 
+/// Run the engine, and again each time it finds flake inputs to take back: a
+/// new lock changes what every target evaluates to, so nothing of the run
+/// before it stands. If a target that built before a rollback, or one it was
+/// for, then fails, or an input comes to a revision it was already sent back
+/// to (targets that last built at different revisions can each undo what the
+/// other needs), rolling back cannot settle it: the lock and pins go back to
+/// how they were, and the run ends without it, holding the targets as it would
+/// have. That can happen once, so with finitely many revisions this ends.
+fn run_rolling_back(
+    engine_with: &dyn Fn(bool) -> Result<Engine>,
+    lock_path: &Path,
+    pins_path: &Path,
+    allowed: bool,
+) -> Result<(Engine, engine::Report)> {
+    let start_lock = std::fs::read(lock_path)?;
+    let start_pins = std::fs::read(pins_path)?;
+    let mut may_roll_back = allowed;
+    let mut tried: BTreeSet<(String, String)> = BTreeSet::new();
+    let mut must_build: BTreeSet<String> = BTreeSet::new();
+    let mut changes: Vec<String> = Vec::new();
+    loop {
+        let engine = engine_with(may_roll_back)?;
+        let pins_now = std::fs::read(pins_path)?;
+        let mut report = engine.run()?;
+        let mut undo = false;
+        if !report.rollback.is_empty() {
+            must_build.extend(report.built.iter().map(|(t, _)| t.to_string()));
+            must_build.extend(report.rollback.iter().flat_map(|r| r.targets.clone()));
+            for r in &report.rollback {
+                let revision = r.locked["narHash"].as_str().unwrap_or_default();
+                undo |= !tried.insert((r.input.clone(), revision.to_string()));
+            }
+            if !undo {
+                guard::critical(|| crate::pins::write_atomic(pins_path, &pins_now))?;
+                // A revision that cannot be locked is one more reason to hold.
+                match inputs::apply(
+                    &engine.nix,
+                    lock_path,
+                    pins_path,
+                    &report.rollback,
+                    date::today(),
+                ) {
+                    Ok(applied) => {
+                        changes.extend(applied);
+                        continue;
+                    }
+                    Err(e) if guard::timed_out() => return Err(e),
+                    Err(e) => {
+                        log::warn(&format!("rolling back a flake input failed: {e:#}"));
+                        undo = true;
+                    }
+                }
+            }
+        }
+        undo |= report
+            .failed
+            .iter()
+            .any(|t| must_build.contains(&t.to_string()));
+        if undo {
+            log::change(
+                "rolling back flake inputs did not get every target building; putting them back",
+            );
+            guard::critical(|| {
+                crate::pins::write_atomic(lock_path, &start_lock)?;
+                crate::pins::write_atomic(pins_path, &start_pins)
+            })?;
+            may_roll_back = false;
+            must_build.clear();
+            changes.clear();
+            continue;
+        }
+        changes.append(&mut report.changes);
+        report.changes = changes;
+        return Ok((engine, report));
+    }
+}
+
 pub fn reconcile(at: &Where, args: &BuildArgs, how: Activation) -> Result<ExitCode> {
     let update = args.update.as_deref();
     let ctx = Ctx::open(at, true)?;
@@ -671,7 +750,7 @@ pub fn reconcile(at: &Where, args: &BuildArgs, how: Activation) -> Result<ExitCo
 
     // Any error from here on is restored by main, after it is printed.
     let mut last_good = std::collections::HashMap::new();
-    let last_good_pins = targets
+    let last_good_pins: std::collections::HashMap<_, _> = targets
         .iter()
         .filter_map(|t| state::load_last_good_pins(&ctx.flake, t).map(|e| (t.clone(), e)))
         .collect();
@@ -697,36 +776,61 @@ pub fn reconcile(at: &Where, args: &BuildArgs, how: Activation) -> Result<ExitCo
     if let Some(inputs) = update {
         nix.flake_update(inputs)?;
     }
+    inputs::settle(&nix, &lock_path, &pins_path, &cfg.input_deny)?;
 
-    let engine = Engine {
-        nix,
-        pins_path: pins_path.clone(),
-        new_lock: Lock::load(&lock_path)?,
-        old_lock,
-        last_good,
-        last_good_pins,
-        targets,
-        guarded,
-        local: local.clone(),
-        pins_rel: format!(
-            "{}{PINS}",
-            git.as_ref().map(|g| g.prefix()).unwrap_or_default()
-        ),
-        deny: cfg.deny.clone(),
-        system: args.system.clone(),
-        max_rounds: args.max_rounds,
-        max_new_pins: args.max_new_pins,
-        warn_after_days: cfg.warn_after_days,
-        today: date::today(),
-        donors: cfg.donors.clone(),
-        retry_same_after_days: cfg.retry_same_derivation_after_days,
-        copies: Default::default(),
+    let flake_targets = nix.flake_targets();
+    // flake.lock is the whole flake's. A run may only roll an input back if it
+    // speaks for the whole flake: it builds a fleet, or nothing is left out.
+    let covers_flake = args.hold_local
+        || flake_targets.as_ref().is_some_and(|all| {
+            all.iter()
+                .all(|t| targets.iter().any(|mine| mine.to_string() == *t))
+        });
+    let engine_with = |may_roll_back: bool| -> Result<Engine> {
+        Ok(Engine {
+            nix: Nix::new(&ctx.flake),
+            pins_path: pins_path.clone(),
+            new_lock: Lock::load(&lock_path)?,
+            old_lock: old_lock.clone(),
+            last_good: last_good.clone(),
+            last_good_pins: last_good_pins.clone(),
+            targets: targets.clone(),
+            guarded: guarded.clone(),
+            local: local.clone(),
+            pins_rel: format!(
+                "{}{PINS}",
+                git.as_ref().map(|g| g.prefix()).unwrap_or_default()
+            ),
+            deny: cfg.deny.clone(),
+            system: args.system.clone(),
+            max_rounds: args.max_rounds,
+            max_new_pins: args.max_new_pins,
+            warn_after_days: cfg.warn_after_days,
+            today: date::today(),
+            donors: cfg.donors.clone(),
+            input_deny: cfg.input_deny.clone(),
+            package_sets: cfg
+                .package_sets
+                .iter()
+                .cloned()
+                .chain([cfg.input.clone().unwrap_or_else(|| "nixpkgs".into())])
+                .collect(),
+            flake_targets: flake_targets.clone(),
+            may_roll_back,
+            retry_same_after_days: cfg.retry_same_derivation_after_days,
+            copies: Default::default(),
+        })
     };
     log::set_dry_run(args.dry_run);
-    let report = engine.run();
+    let result = run_rolling_back(
+        &engine_with,
+        &lock_path,
+        &pins_path,
+        args.only.is_empty() && covers_flake,
+    );
     log::set_dry_run(false);
     guard::built();
-    let report = report?;
+    let (engine, report) = result?;
 
     if report.local_failure.is_some() {
         guard::restore()?;
@@ -870,6 +974,42 @@ pub fn reconcile(at: &Where, args: &BuildArgs, how: Activation) -> Result<ExitCo
     Ok(code)
 }
 
+/// `nix flake update` that leaves a pinned flake input alone until there is
+/// something new to try, so the lock only changes when something upstream did:
+/// a fleet's "nothing changed" check goes on working while an input is pinned.
+pub fn update(at: &Where) -> Result<ExitCode> {
+    let ctx = Ctx::open(at, false)?;
+    ctx.announce();
+    check_flake(&ctx)?;
+    let _run_lock = guard::lock_flake(&ctx.flake)?;
+    let lock_path = ctx.flake.join("flake.lock");
+    let pins_path = ctx.pins_path();
+    let deny = ctx
+        .config
+        .as_ref()
+        .map_or_else(Vec::new, |c| c.input_deny.clone());
+    let lock =
+        std::fs::read(&lock_path).with_context(|| format!("reading {}", lock_path.display()))?;
+    let pins = match std::fs::read(&pins_path) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e).with_context(|| format!("reading {}", pins_path.display())),
+    };
+    guard::arm(guard::Restore {
+        lock_path: lock_path.clone(),
+        lock,
+        pins_path: pins_path.clone(),
+        pins,
+        untrack: false,
+        flake: ctx.flake.clone(),
+    });
+    let nix = Nix::new(&ctx.flake);
+    nix.flake_update(&[])?;
+    inputs::settle(&nix, &lock_path, &pins_path, &deny)?;
+    guard::settle(|| Ok(()))?;
+    Ok(ExitCode::SUCCESS)
+}
+
 pub fn merge(at: &Where, other: &Path) -> Result<ExitCode> {
     let ctx = Ctx::open(at, false)?;
     ctx.announce();
@@ -895,13 +1035,16 @@ pub fn merge(at: &Where, other: &Path) -> Result<ExitCode> {
     let pins_path = ctx.pins_path();
     ensure_pins(&pins_path, Git::open(&ctx.flake).as_ref(), false)?;
     let mut file = PinsFile::load(&pins_path)?;
+    let lock_sha256 = Lock::load(&ctx.flake.join("flake.lock"))
+        .ok()
+        .map(|l| l.sha256());
     let mut taken = 0;
     for (kind, name, entry) in incoming.entries() {
         let target = Target::new(kind, name);
         if file.entry(kind, name) == Some(entry) {
             continue;
         }
-        if file.merge(kind, name, entry.clone()) {
+        if file.merge_for_lock(kind, name, entry.clone(), lock_sha256.as_deref()) {
             taken += 1;
             log::info(&format!("took {target} from {}", other.display()));
         } else {
@@ -909,6 +1052,13 @@ pub fn merge(at: &Where, other: &Path) -> Result<ExitCode> {
                 "kept {target}: the entry here comes from a newer lock"
             ));
         }
+    }
+    if file.merge_inputs(&incoming) {
+        taken += 1;
+        log::info(&format!(
+            "took the flake input pins from {}",
+            other.display()
+        ));
     }
     file.save(&pins_path)?;
     log::change(&format!(
@@ -1036,6 +1186,24 @@ pub fn status(at: &Where, json: bool) -> Result<ExitCode> {
             });
         }
     }
+    let input_pins = file.inputs.len();
+    for (input, pin) in &file.inputs {
+        rows.push(Row {
+            target: "flake".into(),
+            what: format!("input {input}"),
+            reason: format!(
+                "{}{}",
+                crate::summary::input_cause(pin),
+                if pin.retrying { ", retrying" } else { "" }
+            ),
+            since: format!(
+                "{}  at {}",
+                since(&pin.since, false),
+                engine::describe(&pin.locked)
+            ),
+            note: None,
+        });
+    }
     if rows.is_empty() {
         println!("no pins and nothing held");
         return Ok(ExitCode::SUCCESS);
@@ -1066,19 +1234,49 @@ pub fn status(at: &Where, json: bool) -> Result<ExitCode> {
         }
     }
     println!(
-        "{}, {held} held, {stale} stale (older than {warn} days).",
-        engine::plural(pins, "pinned package")
+        "{}, {}{held} held, {stale} stale (older than {warn} days).",
+        engine::plural(pins, "pinned package"),
+        if input_pins > 0 {
+            format!("{}, ", engine::plural(input_pins, "pinned flake input"))
+        } else {
+            String::new()
+        }
     );
     println!("  nixheal why ATTR       explains a pin");
     println!("  nixheal retry ATTR     retries one now, keeping it if the package still fails");
     println!("  nixheal clear ATTR     removes one");
     println!("  nixheal clear --held   releases a hold (with --host or --home NAME)");
+    if input_pins > 0 {
+        println!("  nixheal clear --flake-input INPUT   removes a flake input's pin");
+    }
     Ok(ExitCode::SUCCESS)
 }
 
 pub fn why(at: &Where, pick: &Pick, attr: &str) -> Result<ExitCode> {
     let ctx = Ctx::open(at, false)?;
     let file = PinsFile::load(&ctx.pins_path())?;
+    if let Some(pin) = file.inputs.get(attr)
+        && !file
+            .entries()
+            .any(|(_, _, e)| e.packages().contains_key(attr))
+    {
+        println!("flake input {attr} is held back in flake.lock, for the whole flake");
+        println!("since:     {}", pin.since);
+        println!("kept at:   {}", engine::describe(&pin.locked));
+        println!("cause:     {}", crate::summary::input_cause(pin));
+        println!("failed on: {}", pin.targets.join(", "));
+        if pin.retrying {
+            println!("retrying:  the lock has a newer revision that the next build tests");
+        } else {
+            println!("retried:   once upstream has a new revision");
+        }
+        if let Some(drv) = &pin.failed_drv
+            && let Some(tail) = nix::log_tail(drv, 20)
+        {
+            println!("\nend of the build log of {drv}:\n{tail}");
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
     let target = ctx.target(pick, Some(&file))?;
     let Some(sets) = file
         .entry(target.kind, &target.name)
@@ -1342,6 +1540,24 @@ pub fn retry(at: &Where, pick: &Pick, attr: &str, input: Option<&str>) -> Result
     log::change(&format!(
         "{target}: the next build, switch or boot retries {attr} ({}): the pin goes if it builds, and stays at its revision if it still fails",
         inputs.join(", ")
+    ));
+    Ok(ExitCode::SUCCESS)
+}
+
+pub fn clear_input(at: &Where, input: &str) -> Result<ExitCode> {
+    let ctx = Ctx::open(at, false)?;
+    ctx.announce();
+    check_flake(&ctx)?;
+    let _run_lock = guard::lock_flake(&ctx.flake)?;
+    let pins_path = ctx.pins_path();
+    let mut file = PinsFile::load(&pins_path)?;
+    if file.inputs.remove(input).is_none() {
+        bail!("flake input {input} is not pinned");
+    }
+    file.touch_inputs();
+    file.save(&pins_path)?;
+    log::change(&format!(
+        "unpinned input {input}; flake.lock stays as it is until the next update moves it, and it is pinned again if it still fails then"
     ));
     Ok(ExitCode::SUCCESS)
 }

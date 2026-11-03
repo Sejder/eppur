@@ -209,6 +209,38 @@ inputs.nixpkgs-stable.url = "https://channels.nixos.org/nixos-26.05/nixexprs.tar
 programs.nixheal.donors = [ "nixpkgs-stable" ];
 ```
 
+**Flake input.** A package from a flake input other than a package set never
+passes through the overlay, so it cannot be pinned. When a target fails in a way
+no pin helps with, nixheal looks at the inputs that changed since the target last
+built, first checking that the failure happens again, and tries each one put
+back: a configuration that no longer evaluates has to evaluate, and what the input
+changes under the failed build's name has to build (more than ten of those and
+the input is not tested). The first input that does this goes back to
+that revision in `flake.lock`, and the whole run starts again on that lock, which
+also finds any further failure. It is tested rather than guessed from names,
+since two inputs can provide a package of the same name. `flake.lock` has one revision per input, so
+this holds for every target, not one: targets that do not use the input are not
+affected, and everything else in the lock still updates. It is recorded under
+`inputs` in `pins.json`.
+
+While upstream stays at the revision that failed, an update puts the input back,
+leaving the lock unchanged. A new revision is tried by the next build: the pin
+goes once every target it failed on builds, and otherwise the input goes back
+again, keeping the pin's date. If a target still fails after the rollback, a
+target that built before it now fails, or targets need revisions that exclude
+each other, rolling back cannot settle it: the lock and pins go back to how they
+were and the targets are held, all of them, even one a rollback had fixed.
+
+Never rolled back: package sets and donors, inputs that other inputs follow,
+inputs whose branch or URL changed in `flake.nix`, and inputs listed in
+`programs.nixheal.inputDeny`. **List any input holding secrets there**: going back
+to an older revision restores secrets rotated since, and a host held for a long
+time takes the input back as far as the lock it is held on.
+
+`flake.lock` is the whole flake's, so only a run that speaks for the whole flake
+rolls back: one with `--hold-local`, or whose config lists every host and home the
+flake has, and without `--only`. Any other run holds or gives up as it would have.
+
 ## Commands
 
 The verbs follow `nh` and `nixos-rebuild`:
@@ -220,9 +252,11 @@ The verbs follow `nh` and `nixos-rebuild`:
 | `nixheal boot [--update [INPUT...]]` | the same, then make this machine boot into it |
 | `nixheal status [--json]` | pinned packages and held hosts with their age |
 | `nixheal why <attr>` | the failed derivation (or the evaluation error), the path up to the pinned package, the end of the build log |
+| `nixheal update` | `nix flake update`, keeping a pinned flake input where it is until upstream has a new revision |
 | `nixheal pin <attr> [--input I] [--old-lock FILE]` | pin by hand (in `programs.nixheal.input` by default), at the current lock or at the input's revision in `FILE`, e.g. a `flake.lock` from git history for a package that builds but misbehaves; kept until cleared |
 | `nixheal retry <attr> [--input I]` | have the next run retry a pin nixheal made: the pin goes if the package builds, and stays at its revision if it still fails; `status` shows it as "retry queued" |
 | `nixheal clear <attr> [--input I]` (or `unpin`) | remove a pin; if the package still fails, the next run pins it again at the revision it last built with |
+| `nixheal clear --flake-input I` | remove a flake input's pin; `flake.lock` stays until the next update moves it, and it is pinned again if it still fails then |
 | `nixheal clear --held` | release a held host or home: drop its held lock, so machines that skip held entries update again, and the next run builds it with the current lock |
 | `nixheal merge <file>` | fold another `pins.json` in; per host or home, the entry from the newer lock wins, keeping pins made by hand here |
 
@@ -263,7 +297,7 @@ Options of `build`, `switch` and `boot`:
 
 nixheal works in a dirty tree. When it commits, it commits only `flake.lock`
 and `pins.json`, without running git hooks or signing. A run takes a lock on the
-flake (also taken by `pin`, `clear` and `merge`), so a timer run and a manual
+flake (also taken by `update`, `pin`, `clear` and `merge`), so a timer run and a manual
 run cannot overlap, and Ctrl-C or SIGTERM puts both files back. A flake path
 containing `#` or `?` is refused, since nix would read those as part of a
 flake reference. On a terminal, builds are shown through
@@ -309,6 +343,7 @@ required, the rest default as the module options do):
 | `commit` | `false` | commit `flake.lock` and `pins.json` after each run, as with `--commit` |
 | `pinnedOverlays` | `true` | apply your own nixpkgs overlays to pinned packages (see below) |
 | `donors` | `[ ]` | flake inputs a failed package may be pinned to when one has a newer, already built copy of it (see [Donor](#concepts)) |
+| `inputDeny` | `[ ]` | flake inputs never to roll back in `flake.lock` when they break a build; a trailing `*` matches a prefix, so `[ "*" ]` turns rolling back off (see [Flake input](#concepts)) |
 | `retrySameDerivationAfterDays` | `7` | retry a build failure whose derivation an update did not change only after this many days; `0` on every move of its input |
 | `package` | this flake's | the nixheal package |
 | `nixpkgs.<input>` | `{ }` | another nixpkgs to import with pins applied: `source`, `config` (default: this host's `nixpkgs.config`), `argName` |
@@ -378,13 +413,19 @@ the way a binary cache host would:
 
 1. On the build host, list every machine in `hosts` and run
    `nixheal build --update --hold-local --no-commit --gc-roots DIR` on a timer.
-   A host that cannot be fixed is held; the others still get the new lock.
+   A host that cannot be fixed is held; the others still get the new lock. To
+   skip the build when nothing changed, run `nixheal update` first and compare
+   `flake.lock` with what you published; a plain `nix flake update` moves a pinned
+   flake input, so that comparison would never match while one is pinned.
 2. Publish `flake.lock` and `pins.json` together (`pins.json` first). Each host
    entry carries the `lockSha256` it was computed for, so a consumer can refuse
    a mismatched pair. A held entry keeps the `lockSha256` of the lock it is held
    on, so check `held` before comparing.
 3. On each machine, install both into its checkout before rebuilding. A machine
-   whose entry is `held` should skip the update and stay on what it runs.
+   whose entry is `held` should skip the update and stay on what it runs. A lock
+   may be older than the last one for an input listed under `inputs` in `pins.json`,
+   and for what that input brings along: a check that refuses to move an input
+   backwards should leave those out, or it waits until upstream is fixed.
 4. Fold the published `pins.json` back into your repository with
    `nixheal merge`, so manual runs and the fleet do not overwrite each other.
 
@@ -406,7 +447,8 @@ homepage-dashboard `customapi` widget:
 `warnAfterDays`), `HELD`, `PINNED` and `OK`. Manual pins never go stale. `items`
 has one row per pinned package or held host for a `dynamic-list` widget, and a
 single `OK` row when nothing is pinned; targets are named `host NAME` and
-`home NAME`, as everywhere else. `pins` counts packages, `pin_entries` the pins
+`home NAME`, as everywhere else. `pins` counts packages and flake inputs,
+`input_pins` the flake inputs, `pin_entries` the pins
 across package sets. For scripts, each row also has `target`, `target_kind`
 (`host` or `home`) and `since`, plus `inputs` and `attr` for a pin or
 `held_reason` for a hold. A pin's row says why and what it provides: `cause`
@@ -445,6 +487,13 @@ host server  -                                       whole host held  2026-10-01
 - **A pin holds back fixes for that package**, security fixes included. That is
   the trade: everything else updates. `warnAfterDays` and `status` make old
   pins visible; check `nixheal why` and fix or `nixheal clear` them.
+- **A rolled back flake input holds back its fixes** for every target that uses
+  it, security fixes included, and a run that rolls one back evaluates everything
+  again. `warnAfterDays` and `status` make it visible.
+- **Other update tools move a pinned flake input.** After a plain
+  `nix flake update`, the next nixheal run puts it back if upstream has not moved.
+  A script that compares the lock after updating, to skip a build, should run
+  `nixheal update` instead.
 - **Only top-level attributes are pinned.** A broken package inside a nested set
   (`python3Packages.foo`) is handled by pinning the top-level package that uses
   it; nixheal finds that from the build graph or from the evaluation trace.
@@ -487,14 +536,21 @@ host server  -                                       whole host held  2026-10-01
                 "pins": { "nixpkgs": { "sbctl": { "locked": { ... }, "since": "2026-10-27", "reason": "build",
                                                   "failedDrv": "...", "trail": [ ... ], "checkedNarHash": "..." } } } },
     "server": { "held": { "since": "2026-10-27", "reason": "...", "lock": { ... } } } },
-  "homes": { } }
+  "homes": { },
+  "inputs": { "atlas": { "locked": { ... }, "failedNarHash": "...", "since": "2026-11-02", "reason": "build",
+                         "failedDrv": "...", "targets": [ "host server" ] } },
+  "inputsChanged": 1793500000 }
 ```
 
 `locked` is the flake.lock node of the nixpkgs the package is taken from, so
 the overlay fetches it purely. A run replaces the entries of the targets it
 built and leaves the others alone. `nixheal merge` combines two files: per
-target, the entry from the newer lock wins (a held entry counts the lock it was
+target, an entry made for the flake's current `flake.lock` wins over one that was
+not, then the entry from the newer lock (a held entry counts the lock it was
 tried against, `checkedLastModified`), and pins made by hand here are kept.
+`inputs` is one decision about one lock, so the map with the later
+`inputsChanged` is taken whole. `inputs` and `inputsChanged` are absent until an
+input is first pinned.
 
 `pins.json` is code, like `flake.lock`: every `locked` node in it is fetched
 and imported when your systems evaluate. Only merge files from a build host

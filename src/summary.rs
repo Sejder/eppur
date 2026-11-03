@@ -2,7 +2,7 @@ use crate::config::Target;
 use crate::date;
 use crate::engine::describe;
 use crate::logparse::strip_version;
-use crate::pins::{Pin, PinsFile, Reason};
+use crate::pins::{InputPin, Pin, PinsFile, Reason};
 use serde_json::{Value, json};
 
 struct Item {
@@ -37,6 +37,15 @@ pub fn cause(pin: &Pin) -> String {
         },
         Reason::Eval => "evaluation failed".into(),
         Reason::Manual => "pinned by hand".into(),
+    }
+}
+
+/// What made nixheal pin a flake input.
+pub fn input_cause(pin: &InputPin) -> String {
+    match (&pin.failed_drv, &pin.error) {
+        (Some(drv), _) => format!("{} failed to build", drv_name(drv)),
+        (None, Some(error)) if !error.is_empty() => format!("evaluation failed: {error}"),
+        _ => "evaluation failed".into(),
     }
 }
 
@@ -149,6 +158,32 @@ pub fn summary(
             });
         }
     }
+    for (input, pin) in &file.inputs {
+        pins += 1;
+        pin_entries += 1;
+        items.push(Item {
+            what: format!("flake input {input}"),
+            kind: "input",
+            days: date::parse(&pin.since).map(|d| today - d),
+            detail: format!(
+                "{}; kept at {}{}",
+                input_cause(pin),
+                describe(&pin.locked),
+                if pin.retrying { ", retrying" } else { "" }
+            ),
+            fields: json!({
+                "input": input,
+                "targets": pin.targets,
+                "since": pin.since,
+                "cause": input_cause(pin),
+                "failed": pin.failed_drv.as_deref().map(drv_name),
+                "rev": pin.locked["rev"].as_str().map(|_| describe(&pin.locked)),
+                "rev_date": pin.locked["lastModified"].as_i64().map(|t| date::format(t / 86_400)),
+                "retrying": pin.retrying,
+                "error": pin.error,
+            }),
+        });
+    }
     items.sort_by_key(|i| std::cmp::Reverse(i.days.unwrap_or(i64::MAX)));
 
     let is_stale = |i: &Item| i.kind != "manual" && i.days.is_none_or(|d| d > warn_after_days);
@@ -215,6 +250,7 @@ pub fn summary(
         "status": status,
         "pins": pins,
         "pin_entries": pin_entries,
+        "input_pins": file.inputs.len(),
         "held": held,
         "stale": stale,
         "oldest": oldest.map_or("-".to_string(), |i| format!("{}, {}", i.what, age(i))),

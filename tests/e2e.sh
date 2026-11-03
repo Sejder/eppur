@@ -1079,4 +1079,424 @@ expect_built a hello-90
 git -C "$sys" checkout -q -- flake.lock pins.json
 write_config ""
 
+
+# Flake inputs: packages that come from an input other than a package set never
+# pass through the overlay, so the input itself goes back in flake.lock.
+sys="$work/system-inputs"
+exta="$work/exta"
+extb="$work/extb"
+mkdir -p "$sys" "$exta" "$extb"
+export_ext() {
+  # $1 directory, $2 name, $3 version, $4 ok, broken, evalfail, or needsok: it
+  # builds only while the toy's extra is ok, so an update elsewhere can break it.
+  local body="echo $2-$3 > \$out"
+  [ "$4" = broken ] && body="echo $2 does not compile >&2; exit 1"
+  [ "$4" = needsok ] && body="[ \${extra} = ok ] || exit 1; echo $2-$3 > \$out"
+  [ "$4" = faila ] && body="[ \${host} != a ] || exit 1; echo $2-$3 > \$out"
+  [ "$4" = failb ] && body="[ \${host} != b ] || exit 1; echo $2-$3 > \$out"
+  local value="derivation { name = \"$2-web-$3\"; inherit system; salt = \"$salt\"; builder = \"/bin/sh\"; args = [ \"-c\" \"$body\" ]; }"
+  [ "$4" = evalfail ] && value="throw \"$2 lost an option\""
+  [ "$4" = configfail ] && value="{ configError = true; }"
+  [ "$4" = gluefail ] && value="$value // { glueError = true; }"
+  printf '{ system, toy, host ? \"\" }:\nlet extra = (import (toy + "/state.nix")).extra; in\n%s\n' "$value" >"$1/default.nix"
+  git -C "$1" add -A
+  git -C "$1" commit -qm "$2 $3 $4"
+}
+git -C "$exta" init -q -b main
+git -C "$extb" init -q -b main
+export_ext "$exta" exta 1 ok
+export_ext "$extb" extb 1 ok
+
+cp "$repo/nix/overlay.nix" "$repo/nix/platform.nix" "$repo/nix/import-pinned.nix" "$repo/nix/marked.nix" "$sys/"
+cat >"$sys/flake.nix" <<EOF
+{
+  inputs.toypkgs = { url = "git+file://$toy"; flake = false; };
+  inputs.exta = { url = "git+file://$exta"; flake = false; };
+  inputs.extb = { url = "git+file://$extb"; flake = false; };
+  outputs = { self, toypkgs, exta, extb, ... }:
+    let
+      system = "$system";
+      mk = name: paths:
+        let
+          pkgs = import toypkgs {
+            inherit system;
+            overlays = [ (import ./overlay.nix { pins = ./pins.json; kind = "hosts"; inherit name; input = "toypkgs"; }) ];
+          };
+          a = import exta { inherit system; toy = toypkgs; host = name; };
+          b = import extb { inherit system; toy = toypkgs; host = name; };
+        in {
+          config.programs.nixheal =
+            if pkgs.moduleError || a.configError or false then
+              throw "The option \`services.gone' does not exist. Definition values:"
+            else {
+              enable = true;
+              inherit name;
+              pinsFile = ./pins.json;
+              packageSets.toypkgs = pkgs;
+            };
+          config.system.build.toplevel = derivation {
+            name = "toplevel-\${name}";
+            inherit system;
+            paths = paths pkgs a b;
+            builder = "/bin/sh";
+            args = [ "-c" (if name != "c" && a.glueError or false then "exit 1" else "echo \$paths > \$out") ];
+          };
+        };
+    in {
+      nixosConfigurations.a = mk "a" (p: x: y: [ p.hello x y ]);
+      nixosConfigurations.b = mk "b" (p: x: y: [ p.hello x y ]);
+      nixosConfigurations.c = mk "c" (p: x: y: [ p.hello ]);
+    };
+}
+EOF
+write_inputs_config() {
+  COMMIT=false write_config "" "\"input\": \"toypkgs\", \"inputDeny\": [${1:-}]" '"a", "b", "c"'
+}
+locked_rev() { nix eval --raw --impure --expr "(builtins.fromJSON (builtins.readFile $sys/flake.lock)).nodes.$1.locked.rev"; }
+input_field() { jq_pins "toString (f.inputs.$1.$2 or \"\")"; }
+input_pins() { jq_pins "builtins.concatStringsSep \" \" (builtins.attrNames (f.inputs or { }))"; }
+expect_input_pins() {
+  local got
+  got="$(input_pins)"
+  [ "$got" = "$1" ] || fail "expected input pins [$1], got [$got]"
+  echo "input pins: [$got]"
+}
+expect_not_held() { [ -z "$(held_reason "$1")" ] || fail "$1 is held: $(held_reason "$1")"; }
+write_inputs_config
+git -C "$sys" init -q -b main
+git -C "$sys" add flake.nix overlay.nix platform.nix import-pinned.nix marked.nix
+revision fixed false 100 ok
+nix flake lock "$sys"
+git -C "$sys" add flake.lock
+git -C "$sys" commit -qm system
+
+step "inputs: everything builds at first, and pins.json has no input pins"
+nixheal_ build || fail "the first build of the inputs flake gave up"
+expect_input_pins ""
+grep -q inputsChanged "$sys/pins.json" && fail "a pins.json without input pins mentions them"
+git -C "$sys" add -A
+git -C "$sys" commit -qm built
+good_a="$(locked_rev exta)"
+good_b="$(locked_rev extb)"
+
+step "inputs: two inputs move, one breaks: only that one goes back, the rest still update"
+export_ext "$exta" exta 2 broken
+export_ext "$extb" extb 2 ok
+revision fixed false 101 ok
+new_toy="$(git -C "$toy" rev-parse HEAD)"
+nixheal_ build --update --no-commit || fail "rolling back exta gave up"
+expect_log "pinned input exta at "
+reject_log "pinned input extb"
+reject_log "held host"
+expect_input_pins exta
+for h in a b c; do expect_not_held "$h"; done
+[ "$(locked_rev exta)" = "$good_a" ] || fail "exta did not go back to $good_a: $(locked_rev exta)"
+[ "$(locked_rev extb)" != "$good_b" ] || fail "extb, which is fine, was held back too"
+[ "$(locked_rev toypkgs)" = "$new_toy" ] || fail "toypkgs did not update past the broken exta"
+expect_built a hello-101
+[ "$(input_field exta reason)" = build ] || fail "exta should be a build pin"
+[ -n "$(input_field exta failedDrv)" ] || fail "exta records no failed drv"
+expect_log "1 pinned"
+git -C "$sys" add -A
+git -C "$sys" commit -qm "exta pinned"
+
+step "inputs: while upstream stays broken, update leaves the lock and pins byte for byte"
+cp "$sys/flake.lock" "$work/lock.before"
+cp "$sys/pins.json" "$work/pins.before"
+nixheal_ update || fail "nixheal update failed"
+cmp "$sys/flake.lock" "$work/lock.before" || fail "update moved the lock of a pinned input: $(cat "$log")"
+cmp "$sys/pins.json" "$work/pins.before" || fail "update changed pins.json for nothing"
+nixheal_ update || fail "the second nixheal update failed"
+cmp "$sys/flake.lock" "$work/lock.before" || fail "a second update moved the lock"
+
+step "inputs: a revision that can no longer be fetched neither stops updates nor changes pins.json each poll"
+sed -i "s/$good_a/0000000000000000000000000000000000000000/" "$sys/pins.json"
+nixheal_ update || fail "update stopped on a pinned revision that is gone"
+expect_log "cannot put input exta back"
+[ "$(input_field exta retrying)" = 1 ] || fail "the pin is not retrying after failing to restore"
+cp "$sys/pins.json" "$work/pins.gone"
+nixheal_ update || fail "the second update stopped on a pinned revision that is gone"
+cmp "$sys/pins.json" "$work/pins.gone" || fail "a second failed restore changed pins.json"
+git -C "$sys" checkout -q -- flake.lock pins.json
+
+step "inputs: a machine configured for other targets keeps the pin and does not decide about it"
+COMMIT=false write_config "" '"input": "toypkgs"' '"c"'
+nixheal_ build --hold-local --no-commit || fail "the build for c alone gave up"
+reject_log "unpinned input"
+expect_input_pins exta
+git -C "$sys" checkout -q -- flake.lock pins.json
+write_inputs_config
+
+step "inputs: status, status --json and why show the pin"
+nixheal_ status || fail "nixheal status failed"
+expect_log "input exta"
+expect_log "1 pinned flake input"
+"$nixheal" status --json --config "$config" >"$work/status.json" 2>/dev/null || fail "status --json failed"
+json_field() { nix eval --raw --impure --expr "let j = builtins.fromJSON (builtins.readFile $work/status.json); in toString ($1)"; }
+[ "$(json_field j.input_pins)" = 1 ] || fail "status --json: input_pins is $(json_field j.input_pins)"
+[ "$(json_field j.status)" = PINNED ] || fail "status --json: status is $(json_field j.status)"
+[ "$(json_field '(builtins.head j.items).name')" = "flake input exta" ] || fail "status --json has no row for exta"
+nixheal_ why exta || fail "nixheal why exta failed"
+expect_log "held back in flake.lock"
+expect_log "exta does not compile"
+
+step "inputs: nix flake update alone is undone by the next build"
+nix flake update --flake "$sys" 2>/dev/null
+[ "$(locked_rev exta)" != "$good_a" ] || fail "nix flake update did not move exta"
+nixheal_ build --no-commit || fail "the build after a plain update gave up"
+[ "$(locked_rev exta)" = "$good_a" ] || fail "the build did not put exta back"
+expect_input_pins exta
+cmp "$sys/flake.lock" "$work/lock.before" || fail "putting exta back gave another lock"
+
+step "inputs: a new revision that still fails is pinned again, keeping its date"
+sed -i 's/"since": "[^"]*"/"since": "2026-01-01"/' "$sys/pins.json"
+git -C "$sys" add -A
+git -C "$sys" commit -qm "an older pin"
+failed_before="$(input_field exta failedNarHash)"
+export_ext "$exta" exta 3 broken
+nixheal_ update || fail "nixheal update failed"
+[ "$(locked_rev exta)" != "$good_a" ] || fail "update did not let a new exta through"
+[ "$(input_field exta retrying)" = 1 ] || fail "the new exta is not marked as retrying"
+nixheal_ build --no-commit || fail "retrying exta gave up"
+expect_log "pinned input exta at "
+[ "$(locked_rev exta)" = "$good_a" ] || fail "exta did not go back again"
+[ "$(input_field exta since)" = 2026-01-01 ] || fail "the pin lost its date: $(input_field exta since)"
+[ "$(input_field exta failedNarHash)" != "$failed_before" ] || fail "the pin does not record the newer failure"
+[ -z "$(input_field exta retrying)" ] || fail "the pin is still retrying"
+git -C "$sys" add -A
+git -C "$sys" commit -qm "pinned again"
+
+step "inputs: without any state, a retried pin still knows where it last built"
+export_ext "$exta" exta 3b broken
+nixheal_ update || fail "nixheal update failed"
+XDG_STATE_HOME="$work/no-state" nixheal_ build --no-commit || fail "retrying exta with no state gave up"
+[ "$(locked_rev exta)" = "$good_a" ] || fail "exta did not go back to its pin with no state"
+[ -z "$(input_field exta retrying)" ] || fail "the pin is still retrying"
+git -C "$sys" add -A
+git -C "$sys" commit -qm "pinned again, without state"
+
+step "inputs: a fixed revision takes the pin away, whichever targets are gone by then"
+sed -i 's/"host a",/"host gone",\n        "host a",/' "$sys/pins.json"
+grep -q '"host gone"' "$sys/pins.json" || fail "could not add a removed target to the pin"
+export_ext "$exta" exta 4 ok
+nixheal_ update || fail "nixheal update failed"
+nixheal_ build --no-commit || fail "the fixed exta gave up"
+expect_log "unpinned input exta: builds again"
+expect_input_pins ""
+[ "$(locked_rev exta)" = "$(git -C "$exta" rev-parse HEAD)" ] || fail "exta is not at its fixed revision"
+expect_built a exta-web-4
+git -C "$sys" add -A
+git -C "$sys" commit -qm "exta released"
+
+step "inputs: an input that breaks evaluation goes back too"
+good_a="$(locked_rev exta)"
+export_ext "$exta" exta 5 evalfail
+nixheal_ build --update --no-commit || fail "rolling back the evaluation failure gave up"
+expect_log "pinned input exta at "
+[ "$(input_field exta reason)" = eval ] || fail "exta should be an eval pin"
+[ "$(locked_rev exta)" = "$good_a" ] || fail "exta did not go back"
+for h in a b c; do expect_not_held "$h"; done
+git -C "$sys" checkout -q -- flake.lock pins.json
+export_ext "$exta" exta 6 ok
+nixheal_ build --update --no-commit || fail "the build after the evaluation failure gave up"
+expect_input_pins ""
+git -C "$sys" add -A
+git -C "$sys" commit -qm "exta 6"
+
+step "inputs: a configuration that stops evaluating blames the input, never the package set"
+good_a="$(locked_rev exta)"
+export_ext "$exta" exta 6b configfail
+nixheal_ build --update --no-commit || fail "rolling back the configuration failure gave up"
+expect_log "pinned input exta at "
+[ "$(locked_rev exta)" = "$good_a" ] || fail "exta did not go back"
+for h in a b c; do expect_not_held "$h"; done
+git -C "$sys" checkout -q -- flake.lock pins.json
+export_ext "$exta" exta 6c ok
+revision fixed false 100b ok true
+nixheal_ build --update --no-commit --hold-local || fail "the package set's configuration failure gave up"
+reject_log "pinned input"
+expect_input_pins ""
+[ -n "$(held_reason a)" ] || fail "a is not held when the package set breaks its configuration"
+[ "$(locked_rev toypkgs)" = "$(git -C "$toy" rev-parse HEAD)" ] || fail "the package set was rolled back"
+git -C "$sys" checkout -q -- flake.lock pins.json
+revision fixed false 100c ok
+nixheal_ build --update --no-commit || fail "the build after the configuration failures gave up"
+expect_input_pins ""
+git -C "$sys" add -A
+git -C "$sys" commit -qm "configurations evaluate again"
+
+step "inputs: a failure in a drv every input feeds blames only the input that causes it"
+good_a="$(locked_rev exta)"
+export_ext "$exta" exta 6d gluefail
+export_ext "$extb" extb 6d ok
+nixheal_ build --update --no-commit || fail "rolling back for the system's own drv gave up"
+expect_log "pinned input exta at "
+reject_log "pinned input extb"
+expect_input_pins exta
+[ "$(locked_rev exta)" = "$good_a" ] || fail "exta did not go back"
+[ "$(locked_rev extb)" = "$(git -C "$extb" rev-parse HEAD)" ] || fail "extb, which did nothing, was held back"
+git -C "$sys" checkout -q -- flake.lock pins.json
+export_ext "$exta" exta 6e ok
+nixheal_ build --update --no-commit || fail "the build after the glue failure gave up"
+expect_input_pins ""
+git -C "$sys" add -A
+git -C "$sys" commit -qm "glue is fine again"
+
+step "inputs: a config that leaves targets out does not touch the lock of the whole flake"
+good_a="$(locked_rev exta)"
+export_ext "$exta" exta 6e2 broken
+COMMIT=false write_config "" '"input": "toypkgs"' '"a"'
+if nixheal_ build --update --no-commit; then fail "a narrower config got past the broken exta"; fi
+expect_log "no flake input is rolled back"
+reject_log "pinned input"
+[ "$(locked_rev exta)" = "$good_a" ] || fail "the failed run did not restore the lock"
+write_inputs_config
+
+step "inputs: --only does not touch the lock of the whole flake"
+good_a="$(locked_rev exta)"
+export_ext "$exta" exta 6f broken
+nixheal_ build --update --no-commit --hold-local --only a || fail "the --only run gave up"
+reject_log "pinned input"
+expect_input_pins ""
+[ -n "$(held_reason a)" ] || fail "a is not held by the --only run"
+git -C "$sys" checkout -q -- flake.lock pins.json
+export_ext "$exta" exta 6g ok
+nixheal_ build --update --no-commit || fail "the build after the --only run gave up"
+git -C "$sys" add -A
+git -C "$sys" commit -qm "after --only"
+
+step "inputs: an input whose source changed in flake.nix is not sent back to the old one"
+git -C "$exta" branch -q elsewhere
+git -C "$exta" checkout -q elsewhere
+export_ext "$exta" exta 6h broken
+git -C "$exta" checkout -q main
+cp "$sys/flake.nix" "$work/flake.nix.keep"
+sed -i "s|git+file://$exta\"|git+file://$exta?ref=elsewhere\"|" "$sys/flake.nix"
+nixheal_ build --update --no-commit --hold-local || fail "the build on the new branch gave up"
+reject_log "pinned input"
+[ -n "$(held_reason a)" ] || fail "a is not held on the broken new branch"
+git -C "$sys" checkout -q -- flake.nix flake.lock pins.json
+nixheal_ build --update --no-commit || fail "the build after the branch change gave up"
+git -C "$sys" add -A
+git -C "$sys" commit -qm "after the branch change" --allow-empty
+
+step "inputs: targets that need different revisions end in a hold, not in a loop"
+export_ext "$exta" exta 7a failb
+nixheal_ build --update --no-commit --hold-local --only a --only c || fail "building a on 7a gave up"
+git -C "$sys" add -A
+git -C "$sys" commit -qm "a built on 7a"
+cp "$sys/flake.lock" "$work/7a.lock"
+export_ext "$exta" exta 7a2 faila
+nixheal_ build --update --no-commit --hold-local --old-lock "$work/7a.lock" || fail "the rollback that breaks b gave up"
+expect_log "pinned input exta at "
+expect_log "rolling back flake inputs did not get every target building"
+expect_input_pins ""
+[ -n "$(held_reason a)" ] || fail "a is not held after the rollback was undone"
+expect_not_held b
+[ "$(locked_rev exta)" = "$(git -C "$exta" rev-parse HEAD)" ] || fail "exta was not put back on its new revision"
+expect_built b exta-web-7a2
+git -C "$sys" checkout -q -- flake.lock pins.json
+write_inputs_config '"exta"'
+export_ext "$exta" exta 7b faila
+nixheal_ build --update --no-commit --hold-local || fail "holding a on 7b gave up"
+[ -n "$(held_reason a)" ] || fail "a is not held on 7b"
+expect_not_held b
+git -C "$sys" add -A
+git -C "$sys" commit -qm "a held, b built on 7b"
+write_inputs_config
+export_ext "$exta" exta 7c broken
+timeout 300 "$nixheal" build --update --no-commit --hold-local --config "$config" >"$log" 2>&1 || fail "the conflicting targets did not end: rc $?"
+expect_log "rolling back flake inputs did not get every target building"
+expect_input_pins ""
+[ -n "$(held_reason a)" ] || fail "a is not held after the conflict"
+[ -n "$(held_reason b)" ] || fail "b is not held after the conflict"
+expect_not_held c
+git -C "$sys" reset -q --hard HEAD~2
+export_ext "$exta" exta 7d ok
+nixheal_ build --update --no-commit || fail "the build after the conflict gave up"
+expect_input_pins ""
+git -C "$sys" add -A
+git -C "$sys" commit -qm "after the conflict"
+
+step "inputs: inputDeny holds the hosts instead"
+write_inputs_config '"exta"'
+good_a="$(locked_rev exta)"
+export_ext "$exta" exta 7 broken
+nixheal_ build --update --no-commit --hold-local || fail "the denied rollback gave up"
+reject_log "pinned input"
+expect_input_pins ""
+[ -n "$(held_reason a)" ] || fail "a is not held with exta denied"
+[ -n "$(held_reason b)" ] || fail "b is not held with exta denied"
+expect_not_held c
+git -C "$sys" add -A
+git -C "$sys" commit -qm "held, with the broken exta in the lock"
+
+step "inputs: a held host rolls back from the lock it is held on, not the published one"
+write_inputs_config
+cp "$sys/flake.lock" "$work/published.lock"
+nixheal_ build --no-commit --hold-local --old-lock "$work/published.lock" || fail "rolling back for the held hosts gave up"
+expect_log "pinned input exta at "
+expect_log "released host a"
+[ "$(locked_rev exta)" = "$good_a" ] || fail "exta did not go back to where a is held"
+for h in a b c; do expect_not_held "$h"; done
+git -C "$sys" reset -q --hard HEAD~1
+export_ext "$exta" exta 8 ok
+nixheal_ build --update --no-commit || fail "the build on exta 8 gave up"
+expect_input_pins ""
+git -C "$sys" add -A
+git -C "$sys" commit -qm "exta 8"
+
+step "inputs: an input that would not fix the build is not rolled back"
+export_ext "$exta" exta 9 needsok
+nixheal_ build --update --no-commit || fail "the build on exta 9 gave up"
+expect_input_pins ""
+git -C "$sys" add -A
+git -C "$sys" commit -qm "exta 9"
+export_ext "$exta" exta 10 needsok
+revision fixed false 103 ok false other
+nixheal_ build --update --no-commit --hold-local || fail "the failure no rollback fixes gave up"
+expect_log "testing whether exta at "
+reject_log "pinned input"
+expect_input_pins ""
+[ -n "$(held_reason a)" ] || fail "a is not held when no rollback helps"
+[ -n "$(held_reason b)" ] || fail "b is not held when no rollback helps"
+expect_not_held c
+[ "$(locked_rev exta)" = "$(git -C "$exta" rev-parse HEAD)" ] || fail "exta was not put back on its new revision"
+git -C "$sys" checkout -q -- flake.lock pins.json
+revision fixed false 104 ok
+nixheal_ build --update --no-commit || fail "the build after no rollback helped gave up"
+expect_input_pins ""
+git -C "$sys" add -A
+git -C "$sys" commit -qm "toy is fine again"
+
+step "inputs: merge takes the later input pins, an emptied map too"
+merge_file="$work/other-pins.json"
+pinned_file() {
+  cat >"$merge_file" <<EOF
+{ "version": 2, "hosts": {}, "homes": {}, "inputs": { "exta": {
+    "locked": { "narHash": "sha256-x", "rev": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }, "failedNarHash": "sha256-y",
+    "since": "2026-11-01", "reason": "build", "targets": ["host a"] } }, "inputsChanged": $1 }
+EOF
+}
+empty_file() {
+  printf '{ "version": 2, "hosts": {}, "homes": {}, "inputsChanged": %s }\n' "$1" >"$merge_file"
+}
+pinned_file 99999999999
+nixheal_ merge "$merge_file" || fail "merging input pins failed"
+expect_input_pins exta
+empty_file 99999999998
+nixheal_ merge "$merge_file" || fail "merging older input pins failed"
+expect_input_pins exta
+empty_file 100000000000
+nixheal_ merge "$merge_file" || fail "merging a later emptied map failed"
+expect_input_pins ""
+pinned_file 100000000001
+nixheal_ merge "$merge_file" || fail "merging input pins again failed"
+expect_input_pins exta
+nixheal_ clear --flake-input exta || fail "clearing the input pin failed"
+expect_input_pins ""
+expect_log "unpinned input exta"
+if nixheal_ clear --flake-input exta; then fail "clearing an input that is not pinned succeeded"; fi
+git -C "$sys" checkout -q -- pins.json
+
 printf '\nall e2e steps passed\n'

@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeSet;
 use std::path::Path;
 
 #[derive(Clone)]
@@ -90,6 +91,64 @@ impl Lock {
             .unwrap_or_default()
     }
 
+    /// The nodes a node's own lock is made of: itself and what it takes in
+    /// directly, however deep, leaving out what it follows.
+    fn subtree(&self, node: &str) -> BTreeSet<String> {
+        let mut seen = BTreeSet::new();
+        let mut stack = vec![node.to_string()];
+        while let Some(n) = stack.pop() {
+            if let Some(inputs) = self.json["nodes"][&n]["inputs"].as_object() {
+                stack.extend(
+                    inputs
+                        .values()
+                        .filter_map(|t| t.as_str().map(str::to_string))
+                        .filter(|t| !seen.contains(t)),
+                );
+            }
+            seen.insert(n);
+        }
+        seen
+    }
+
+    /// The root inputs that something outside them follows: a base others
+    /// share, such as nixpkgs. A flake following its own input, which lock
+    /// files spell ["atlas", "nixpkgs"] from inside atlas, does not count.
+    pub fn followed(&self) -> Vec<String> {
+        let mut followed = Vec::new();
+        let Some(nodes) = self.json["nodes"].as_object() else {
+            return followed;
+        };
+        for input in self.inputs() {
+            let Some(top) = self.resolve(self.root(), &input, 0) else {
+                continue;
+            };
+            let own = self.subtree(&top);
+            let used = nodes
+                .iter()
+                .filter(|(name, _)| !own.contains(*name))
+                .filter_map(|(_, node)| node["inputs"].as_object())
+                .flat_map(|inputs| inputs.values())
+                .filter_map(|target| target.as_array()?.first()?.as_str())
+                .any(|first| first == input);
+            if used {
+                followed.push(input);
+            }
+        }
+        followed
+    }
+
+    /// Where a root input comes from, as flake.nix asks for it.
+    pub fn original(&self, input: &str) -> Option<Value> {
+        let node = self.resolve(self.root(), input, 0)?;
+        let original = &self.json["nodes"][node]["original"];
+        original.is_object().then(|| original.clone())
+    }
+
+    /// Whether a root input is locked in its own right, not a `follows`.
+    pub fn is_direct(&self, input: &str) -> bool {
+        self.json["nodes"][self.root()]["inputs"][input].is_string()
+    }
+
     pub fn nar_hash(&self, input: &str) -> Option<String> {
         self.locked(input)?["narHash"].as_str().map(str::to_string)
     }
@@ -127,6 +186,48 @@ mod tests {
     #[test]
     fn follows_paths() {
         assert_eq!(lock().nar_hash("followed").as_deref(), Some("sha256-A"));
+    }
+
+    #[test]
+    fn followed_inputs() {
+        // "followed" in the root is an alias of home-manager's nixpkgs, and hm
+        // follows the root's nixpkgs.
+        let mut followed = lock().followed();
+        followed.sort();
+        assert_eq!(followed, ["home-manager", "nixpkgs"]);
+    }
+
+    #[test]
+    fn a_flake_following_its_own_input_is_not_followed() {
+        let l = Lock::from_bytes(
+            br#"{"nodes":{
+              "atlas":{"inputs":{"bun2nix":"bun2nix","nixpkgs":"nixpkgs_2"}},
+              "bun2nix":{"inputs":{"nixpkgs":["atlas","nixpkgs"],"parts":"parts"}},
+              "parts":{"inputs":{"nixpkgs-lib":["atlas","bun2nix","nixpkgs"]}},
+              "nixpkgs_2":{},
+              "nixpkgs":{},
+              "hm":{"inputs":{"nixpkgs":["nixpkgs"]}},
+              "root":{"inputs":{"atlas":"atlas","nixpkgs":"nixpkgs","hm":"hm"}}
+            },"root":"root"}"#
+                .to_vec(),
+        )
+        .unwrap();
+        assert_eq!(l.followed(), ["nixpkgs"]);
+    }
+
+    #[test]
+    fn following_into_another_input_counts() {
+        let l = Lock::from_bytes(
+            br#"{"nodes":{
+              "atlas":{"inputs":{"nixpkgs":"nixpkgs_2"}},
+              "nixpkgs_2":{},
+              "other":{"inputs":{"nixpkgs":["atlas","nixpkgs"]}},
+              "root":{"inputs":{"atlas":"atlas","other":"other"}}
+            },"root":"root"}"#
+                .to_vec(),
+        )
+        .unwrap();
+        assert_eq!(l.followed(), ["atlas"]);
     }
 
     #[test]

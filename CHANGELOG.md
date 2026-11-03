@@ -1,6 +1,40 @@
 # Changelog
 
-## Unreleased
+## 0.1.5
+
+Flake inputs that break a build go back in `flake.lock`:
+
+- A package from a flake input other than a package set could not be pinned, so
+  one bad commit there held every host using it, away from all other updates
+  too, until it was fixed. nixheal now finds the input by evaluating the failed
+  target with each changed input put back, takes it back to the revision it last
+  built with for the whole flake, and starts the run again. A failed build counts
+  as fixed only if its counterpart builds with the input put back. Evaluation
+  failures count too. A rollback that does not help, or breaks a target that
+  built, is undone, and the targets are held as before. See
+  [Flake input](README.md#concepts).
+- New `nixheal update`, for scripts that compare the lock after updating: it
+  leaves a pinned input where it is until upstream has a new revision. `--update`
+  does the same. Fleet scripts that run `nix flake update` should switch to it, or
+  the lock differs on every poll while an input is pinned.
+- New `programs.nixheal.inputDeny`: inputs never to roll back; `[ "*" ]` turns
+  this off. List any input holding secrets: going back restores secrets rotated
+  since. Package sets, donors, inputs others follow and inputs whose source changed
+  in `flake.nix` are never rolled back. Only a run that speaks for the whole flake
+  rolls back: with `--hold-local`, or a config listing every host and home it has,
+  and without `--only`.
+- `nixheal merge` prefers an entry made for the flake's current `flake.lock`, since
+  rolling back an input can lower the lock's `lastModified`.
+- New `nixheal clear --flake-input`. `status`, `status --json` (rows of kind
+  `input`, and `input_pins`) and `why` show input pins. `merge` takes the later of
+  two files' input pins.
+- A check that refuses to move inputs backwards in a published lock should leave
+  out inputs under `inputs` in `pins.json` and what they bring along.
+- `pins.json` is still version 2. It only gains `inputs` and `inputsChanged` once
+  an input is pinned. An older nixheal ignores them, and drops them when it
+  rewrites the file.
+
+Status and pins:
 
 - `status --json` says why each package is pinned and what the pin provides:
   `cause`, `failed`, `failed_version`, `version`, `donor`, `rev`, `rev_date`,

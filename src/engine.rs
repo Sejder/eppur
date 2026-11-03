@@ -2,6 +2,7 @@ use crate::config::Target;
 use crate::date;
 use crate::graph::{Ascent, Graph};
 use crate::guard;
+use crate::inputs::{self, Rollback};
 use crate::lock::Lock;
 use crate::log;
 use crate::logparse::{self, Failure};
@@ -9,10 +10,16 @@ use crate::nix::{Monitor, Nix};
 use crate::pins::{Entry, Held, Kind, Pin, PinsFile, Reason};
 use crate::resolve::{self, Matcher};
 use anyhow::{Result, bail};
+use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
 
 const ASCENT_CAP: usize = 20_000;
+
+/// A rollback is tested by building what it changes under the failed drv's
+/// name. More of those than this means the name says little, and the test
+/// would build a large part of a system: the target is held instead.
+const MAX_COUNTERPARTS: usize = 10;
 
 /// A package more packages than this depend on is never pinned: the overlay
 /// would swap it in for all of them, and every one would rebuild from source.
@@ -45,6 +52,16 @@ pub struct Engine {
     pub today: i64,
     /// Inputs a failed leaf package may be pinned to instead.
     pub donors: Vec<String>,
+    /// Flake inputs never to roll back.
+    pub input_deny: Vec<String>,
+    /// The package sets the config names, known even when no target evaluates.
+    pub package_sets: Vec<String>,
+    /// Every target the flake has, e.g. "host a", whether or not this run or
+    /// this machine's config covers it; None when its outputs do not evaluate.
+    pub flake_targets: Option<Vec<String>>,
+    /// Whether a target with no pin to help may have flake inputs rolled back;
+    /// off once a rollback in this run did not help.
+    pub may_roll_back: bool,
     pub retry_same_after_days: i64,
     /// Evaluated copies of packages, by target, attr, revision and overlays.
     pub copies: std::cell::RefCell<HashMap<String, Option<Copy>>>,
@@ -65,6 +82,11 @@ pub struct Report {
     pub local_held: bool,
     /// How many targets are held after the run.
     pub held: usize,
+    /// Every target that failed.
+    pub failed: Vec<Target>,
+    /// Flake inputs to take back before running again; when not empty the run
+    /// recorded nothing.
+    pub rollback: Vec<Rollback>,
 }
 
 /// What a target's own programs.nixheal says, read before anything builds.
@@ -99,6 +121,31 @@ struct Wanted {
     error: Option<String>,
 }
 
+/// A failure no pin can help with, which a flake input may have caused.
+#[derive(Debug, Clone)]
+struct Unpinnable {
+    /// The drv that failed; None when the target did not evaluate.
+    failed_drv: Option<String>,
+    error: String,
+}
+
+/// What stands in for the failed drv when an input is put back: the drvs of
+/// the same name that the input changed. A system has many of the same name
+/// (sources, vendored crates) that have nothing to do with the failure.
+fn counterparts(
+    failed: &str,
+    closure: &HashSet<String>,
+    baseline: &HashSet<String>,
+) -> Vec<String> {
+    let name = logparse::strip_version(crate::summary::drv_name(failed));
+    closure
+        .iter()
+        .filter(|d| !baseline.contains(*d))
+        .filter(|d| logparse::strip_version(crate::summary::drv_name(d)) == name)
+        .cloned()
+        .collect()
+}
+
 /// A package as one nixpkgs builds it for a target.
 #[derive(Debug, Clone)]
 pub struct Copy {
@@ -130,6 +177,7 @@ struct State {
     system: std::cell::OnceCell<String>,
     status: Status,
     new_pins: usize,
+    unpinnable: std::cell::RefCell<Option<Unpinnable>>,
 }
 
 impl Engine {
@@ -217,7 +265,257 @@ impl Engine {
                     Status::Failed(format!("still failing after {} rounds", self.max_rounds));
             }
         }
+        if !self.may_roll_back {
+            for st in &states {
+                if matches!(st.status, Status::Failed(_)) && st.unpinnable.borrow().is_some() {
+                    log::info(&format!(
+                        "{}: no flake input is rolled back for this in this run; see Flake input in the README",
+                        st.target
+                    ));
+                }
+            }
+        } else {
+            let rollback = self.rollbacks(&original, &states)?;
+            if !rollback.is_empty() {
+                return Ok(Report {
+                    rollback,
+                    // What the rollback must not break.
+                    built: states
+                        .iter()
+                        .filter(|st| st.status == Status::Done)
+                        .map(|st| (st.target.clone(), st.drv.clone().unwrap_or_default()))
+                        .collect(),
+                    ..Report::default()
+                });
+            }
+        }
         self.finish(original, states)
+    }
+
+    /// The flake inputs behind failures no pin can help with: for each failure
+    /// that still reproduces, the first input that changed since the target
+    /// last built and whose earlier revision gets past it. Tested instead of
+    /// guessed from names, since several inputs can provide a package of the
+    /// same name. One per failure: the run starts again after this, and any
+    /// other failure is found then.
+    fn rollbacks(&self, original: &PinsFile, states: &[State]) -> Result<Vec<Rollback>> {
+        let mut excluded: BTreeSet<String> = self.donors.iter().cloned().collect();
+        excluded.extend(self.package_sets.iter().cloned());
+        excluded.extend(states.iter().flat_map(|st| st.inputs.iter().cloned()));
+        // What other inputs follow is a base they all share, such as nixpkgs.
+        excluded.extend(self.new_lock.followed());
+        let mut found: BTreeMap<String, Rollback> = BTreeMap::new();
+        // The input found for a failed drv or evaluation error: the answer is
+        // the same for every target that has it, and each test evaluates a
+        // whole system. A wrong one for some target fails the run after it.
+        let mut tested: HashMap<String, Option<String>> = HashMap::new();
+        for st in states {
+            if !matches!(st.status, Status::Failed(_)) {
+                continue;
+            }
+            let Some(cause) = st.unpinnable.borrow().clone() else {
+                continue;
+            };
+            // A held target's last good lock is the one it is held on: the
+            // published lock may have moved on to the broken revision.
+            let good = st.held_lock.as_ref().unwrap_or(&st.old_lock);
+            let mut candidates =
+                inputs::candidates(good, &self.new_lock, &excluded, &self.input_deny);
+            // A retried pin knows where it last built, whatever the old lock says.
+            let retrying = |name: &str| original.inputs.get(name).filter(|p| p.retrying);
+            for (name, pin) in &original.inputs {
+                if pin.retrying
+                    && !candidates.contains(name)
+                    && !excluded.contains(name)
+                    && !inputs::denied(name, &self.input_deny)
+                    && self.new_lock.is_direct(name)
+                    && good.original(name) == self.new_lock.original(name)
+                    && self.new_lock.nar_hash(name).as_deref() != pin.good_nar_hash()
+                {
+                    candidates.push(name.clone());
+                }
+            }
+            let revision = |name: &str| {
+                retrying(name)
+                    .map(|p| p.locked.clone())
+                    .or_else(|| good.locked(name))
+            };
+            let key = cause.failed_drv.as_ref().unwrap_or(&cause.error);
+            let culprit = match tested.get(key) {
+                Some(c) => c.clone().filter(|i| candidates.contains(i)),
+                None => {
+                    let mut culprit = None;
+                    let baseline = if candidates.is_empty() {
+                        None
+                    } else {
+                        self.reproduces(st, &cause)?
+                    };
+                    if let Some(baseline) = baseline {
+                        for input in &candidates {
+                            let Some(locked) = revision(input) else {
+                                continue;
+                            };
+                            if self.fixed_by(st, &cause, &baseline, input, &locked)? {
+                                culprit = Some(input.clone());
+                                break;
+                            }
+                        }
+                    }
+                    // An evaluation that now passes may only have needed a
+                    // fetch to work again; it must still fail without the input.
+                    if culprit.is_some()
+                        && cause.failed_drv.is_none()
+                        && matches!(self.nix.drv_path_with(&st.target.output(), None), Ok(Ok(_)))
+                    {
+                        log::info(&format!(
+                            "{}: the failure went away by itself, so no flake input is blamed for it",
+                            st.target
+                        ));
+                        culprit = None;
+                    }
+                    tested.insert(key.clone(), culprit.clone());
+                    culprit
+                }
+            };
+            let Some(input) = culprit else {
+                continue;
+            };
+            let (Some(locked), Some(failed)) = (revision(&input), self.new_lock.nar_hash(&input))
+            else {
+                continue;
+            };
+            let rollback = found.entry(input.clone()).or_insert_with(|| Rollback {
+                input: input.clone(),
+                locked: locked.clone(),
+                failed_nar_hash: failed,
+                reason: if cause.failed_drv.is_some() {
+                    Reason::Build
+                } else {
+                    Reason::Eval
+                },
+                failed_drv: cause.failed_drv.clone(),
+                error: cause.failed_drv.is_none().then(|| cause.error.clone()),
+                targets: Vec::new(),
+            });
+            // Back far enough for every target it failed on.
+            if let (Some(new), Some(old)) = (
+                locked["lastModified"].as_i64(),
+                rollback.locked["lastModified"].as_i64(),
+            ) && new < old
+            {
+                rollback.locked = locked;
+            }
+            rollback.targets.push(st.target.to_string());
+        }
+        Ok(found.into_values().collect())
+    }
+
+    /// Whether the failure is still there without changing anything, built or
+    /// evaluated again, since a flaky test or a failed fetch would otherwise
+    /// look fixed by the first input tried. Returns the target's closure as it
+    /// is, for telling what an input changes; empty when it does not evaluate.
+    fn reproduces(&self, st: &State, cause: &Unpinnable) -> Result<Option<HashSet<String>>> {
+        let result = (|| -> Result<Option<HashSet<String>>> {
+            match (
+                self.nix.drv_path_with(&st.target.output(), None)?,
+                &cause.failed_drv,
+            ) {
+                (Ok(drv), Some(failed)) => {
+                    let closure = self
+                        .nix
+                        .show_drvs(std::slice::from_ref(&drv))?
+                        .closure(&drv);
+                    let still = closure.contains(failed)
+                        && !self.nix.builds(std::slice::from_ref(failed))?;
+                    Ok(still.then_some(closure))
+                }
+                (Ok(_), None) | (Err(_), Some(_)) => Ok(None),
+                (Err(_), None) => Ok(Some(HashSet::new())),
+            }
+        })();
+        let reproduced = match result {
+            Ok(r) => r,
+            Err(e) if guard::timed_out() => return Err(e),
+            Err(e) => {
+                log::info(&format!("testing a flake input failed: {e:#}"));
+                None
+            }
+        };
+        if reproduced.is_none() {
+            log::info(&format!(
+                "{}: the failure did not happen again, so no flake input is blamed for it",
+                st.target
+            ));
+        }
+        Ok(reproduced)
+    }
+
+    /// A test that could not run says nothing against the input, so the target
+    /// is held; only running out of time stops the run.
+    fn or_false(&self, result: Result<bool>) -> Result<bool> {
+        match result {
+            Err(e) if guard::timed_out() => Err(e),
+            Err(e) => {
+                log::info(&format!("testing a flake input failed: {e:#}"));
+                Ok(false)
+            }
+            ok => ok,
+        }
+    }
+
+    /// Whether the target gets past its failure with `input` at `locked`. A
+    /// build failure counts as fixed only if it actually builds: nearly any
+    /// input can change the hash of a drv like the system's own, so a drv that
+    /// merely changed proves nothing.
+    fn fixed_by(
+        &self,
+        st: &State,
+        cause: &Unpinnable,
+        baseline: &HashSet<String>,
+        input: &str,
+        locked: &Value,
+    ) -> Result<bool> {
+        log::info(&format!(
+            "{}: testing whether {input} at {} helps",
+            st.target,
+            describe(locked)
+        ));
+        let result = (|| -> Result<bool> {
+            let flake_ref = crate::nix::flake_ref(locked)?;
+            let drv = match self
+                .nix
+                .drv_path_with(&st.target.output(), Some((input, &flake_ref)))?
+            {
+                Ok(drv) => drv,
+                Err(_) => return Ok(false),
+            };
+            let Some(failed) = &cause.failed_drv else {
+                return Ok(true);
+            };
+            let closure = self
+                .nix
+                .show_drvs(std::slice::from_ref(&drv))?
+                .closure(&drv);
+            if closure.contains(failed) {
+                return Ok(false);
+            }
+            let counterparts = counterparts(failed, &closure, baseline);
+            if counterparts.len() > MAX_COUNTERPARTS {
+                log::info(&format!(
+                    "{}: {input} changes {} derivations named like the failed one; not testing it",
+                    st.target,
+                    counterparts.len()
+                ));
+                return Ok(false);
+            }
+            // With none, the failed drv is simply gone: the run after a
+            // rollback builds the system anyway.
+            if counterparts.is_empty() {
+                return Ok(true);
+            }
+            self.nix.builds(&counterparts)
+        })();
+        self.or_false(result)
     }
 
     /// Every configured target must exist in the flake: a typo in hosts or
@@ -328,9 +626,16 @@ impl Engine {
         entry.lock_last_modified = self.new_lock.last_modified();
         entry.checked_last_modified = self.new_lock.last_modified();
 
+        let unpinnable = std::cell::RefCell::new(None);
         let (inputs, status) = match self.probe(target)? {
             Ok(sets) => (sets, Status::Active),
-            Err(why) => (Vec::new(), Status::Failed(why)),
+            Err(why) => {
+                unpinnable.replace(Some(Unpinnable {
+                    failed_drv: None,
+                    error: why.clone(),
+                }));
+                (Vec::new(), Status::Failed(why))
+            }
         };
         let old_lock = self.last_good.get(target).unwrap_or(&self.old_lock).clone();
 
@@ -350,6 +655,7 @@ impl Engine {
             system,
             status,
             new_pins: 0,
+            unpinnable,
         };
         if st.status == Status::Active {
             self.upgrade(&mut st);
@@ -744,6 +1050,10 @@ impl Engine {
                 let why = msgs
                     .first()
                     .map_or_else(String::new, |m| logparse::headline(m));
+                st.unpinnable.replace(Some(Unpinnable {
+                    failed_drv: None,
+                    error: why.clone(),
+                }));
                 st.status = Status::Failed(format!(
                     "evaluation fails in a way nixheal cannot pin: {why}"
                 ));
@@ -794,6 +1104,10 @@ impl Engine {
                         error: error.clone(),
                     }),
                     None => {
+                        st.unpinnable.replace(Some(Unpinnable {
+                            failed_drv: None,
+                            error: error.clone().unwrap_or_default(),
+                        }));
                         st.status = Status::Failed(format!(
                             "evaluation fails on {attr:?}, and no older nixpkgs that built has it, so pinning cannot help"
                         ));
@@ -875,6 +1189,10 @@ impl Engine {
                         graph.display_name(drv),
                         graph.display_name(&via)
                     ));
+                    st.unpinnable.replace(Some(Unpinnable {
+                        failed_drv: Some(drv.to_string()),
+                        error: format!("{} failed to build", graph.display_name(drv)),
+                    }));
                     return Ok(Err(format!(
                         "{} is not inside any pinnable package",
                         graph.display_name(drv)
@@ -1230,7 +1548,19 @@ impl Engine {
     }
 
     fn finish(&self, original: PinsFile, states: Vec<State>) -> Result<Report> {
-        let mut report = Report::default();
+        let mut report = Report {
+            failed: states
+                .iter()
+                .filter(|st| matches!(st.status, Status::Failed(_)))
+                .map(|st| st.target.clone())
+                .collect(),
+            ..Report::default()
+        };
+        let built: BTreeSet<String> = states
+            .iter()
+            .filter(|st| st.status == Status::Done)
+            .map(|st| st.target.to_string())
+            .collect();
         let local_failure = states.iter().find_map(|st| match &st.status {
             Status::Failed(reason) if Some(&st.target) == self.guarded.as_ref() => {
                 Some(reason.clone())
@@ -1247,6 +1577,39 @@ impl Engine {
             return Ok(report);
         }
         let mut file = original;
+        // A retried input built on every target it failed on that the flake
+        // still has: its pin goes. So does one with no such target left. A
+        // target merely missing from this run or this machine's config says
+        // nothing: it has not been tried.
+        let passed: Vec<String> = file
+            .inputs
+            .iter()
+            .filter(|(_, p)| {
+                let mut remaining = p
+                    .targets
+                    .iter()
+                    .filter(|t| self.flake_targets.as_ref().is_none_or(|f| f.contains(t)))
+                    .peekable();
+                remaining.peek().is_none() || (p.retrying && remaining.all(|t| built.contains(t)))
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in passed {
+            file.inputs.remove(&name);
+            file.touch_inputs();
+            log::change(&format!("unpinned input {name}: builds again"));
+            report.changes.push(format!("unpinned input {name}"));
+        }
+        for (name, pin) in &file.inputs {
+            if let Some(days) = date::parse(&pin.since).map(|d| self.today - d)
+                && days > self.warn_after_days
+            {
+                log::warn(&format!(
+                    "flake input {name} has been held back for {days} days (warn after {}); see nixheal why {name}",
+                    self.warn_after_days
+                ));
+            }
+        }
         let mut done_with: Vec<(Target, Vec<u8>, Option<String>)> = Vec::new();
         for st in states {
             let target = st.target.clone();
@@ -1614,6 +1977,35 @@ pub fn describe(locked: &serde_json::Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn counterparts_are_only_what_the_input_changed() {
+        let set = |names: &[&str]| -> HashSet<String> {
+            names
+                .iter()
+                .map(|n| format!("/nix/store/{n}.drv"))
+                .collect()
+        };
+        let baseline = set(&["fff-web-1.0", "aaa-source", "ccc-openssl-3.0", "ddd-top"]);
+        let closure = set(&[
+            "ggg-web-0.9",
+            "aaa-source",
+            "ccc-openssl-3.0",
+            "hhh-other-1.0",
+            "eee-top",
+        ]);
+        assert_eq!(
+            counterparts("/nix/store/fff-web-1.0.drv", &closure, &baseline),
+            ["/nix/store/ggg-web-0.9.drv"]
+        );
+        // One of many of its name, none of which the input touched.
+        assert!(counterparts("/nix/store/zzz-source.drv", &closure, &baseline).is_empty());
+        assert!(counterparts("/nix/store/ccc-openssl-3.1.drv", &closure, &baseline).is_empty());
+        assert_eq!(
+            counterparts("/nix/store/ddd-top.drv", &closure, &baseline),
+            ["/nix/store/eee-top.drv"]
+        );
+    }
 
     #[test]
     fn pins_file_relative_to_the_flake() {

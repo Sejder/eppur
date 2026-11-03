@@ -176,6 +176,90 @@ impl Nix {
         Ok(())
     }
 
+    /// Run a nix command so an interrupt or --timeout stops it too.
+    fn tracked(&self, mut cmd: Command, what: &str) -> Result<Output> {
+        let child = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .with_context(|| format!("spawning {what}"))?;
+        let id = child.id();
+        crate::guard::track(id);
+        let out = child.wait_with_output();
+        crate::guard::untrack(id);
+        crate::guard::halt_if_interrupted();
+        if crate::guard::timed_out() {
+            bail!("stopped: the run took longer than --timeout");
+        }
+        out.with_context(|| format!("waiting for {what}"))
+    }
+
+    /// Lock these inputs at these flake references, leaving every other input
+    /// where it is.
+    pub fn lock_override(&self, inputs: &[(String, String)]) -> Result<()> {
+        let mut cmd = command();
+        cmd.args(["flake", "lock", &self.flake]);
+        for (name, flake_ref) in inputs {
+            cmd.args(["--override-input", name, flake_ref]);
+        }
+        checked("nix flake lock", self.tracked(cmd, "nix flake lock")?)?;
+        Ok(())
+    }
+
+    /// The drv of `attr` as flake.lock has it, or with one input at another
+    /// revision, without touching flake.lock; Err with nix's message when it
+    /// does not evaluate.
+    pub fn drv_path_with(
+        &self,
+        attr: &str,
+        input: Option<(&str, &str)>,
+    ) -> Result<Result<String, String>> {
+        let mut cmd = command();
+        cmd.args(["eval", "--raw", "--no-write-lock-file"]);
+        if let Some((name, flake_ref)) = input {
+            cmd.args(["--override-input", name, flake_ref]);
+        }
+        cmd.arg(self.installable(&format!("{attr}.drvPath")));
+        let out = self.tracked(cmd, "nix eval")?;
+        if out.status.success() {
+            Ok(Ok(String::from_utf8_lossy(&out.stdout).trim().to_string()))
+        } else {
+            Ok(Err(logparse::strip_ansi(&String::from_utf8_lossy(
+                &out.stderr,
+            ))))
+        }
+    }
+
+    /// Every host and home the flake has, e.g. "host a", or None when its
+    /// outputs do not evaluate.
+    pub fn flake_targets(&self) -> Option<Vec<String>> {
+        let mut targets = Vec::new();
+        for (noun, output) in [
+            ("host", "nixosConfigurations"),
+            ("home", "homeConfigurations"),
+        ] {
+            match self.eval_apply(output, "builtins.attrNames") {
+                Ok(names) => {
+                    let names: Vec<String> = serde_json::from_value(names).ok()?;
+                    targets.extend(names.iter().map(|n| format!("{noun} {n}")));
+                }
+                Err(e) if e.to_string().contains("does not provide attribute") => {}
+                Err(_) => return None,
+            }
+        }
+        Some(targets)
+    }
+
+    /// Whether these derivations build. Not an error when they do not: this
+    /// is a test, and its failures are not reported as the run's.
+    pub fn builds(&self, drvs: &[String]) -> Result<bool> {
+        let mut cmd = command();
+        cmd.args(["build", "--no-link"]);
+        cmd.args(drvs.iter().map(|d| format!("{d}^*")));
+        Ok(self.tracked(cmd, "nix build")?.status.success())
+    }
+
     /// The drvPath of `attr`, or the evaluation error messages.
     pub fn drv_path(
         &self,
@@ -359,6 +443,19 @@ pub fn available(out: &str) -> bool {
             .is_ok_and(|s| s.success())
     };
     valid(None) || substituters().iter().any(|s| valid(Some(s)))
+}
+
+/// A flake.lock node's `locked` as a flake reference for the command line.
+pub fn flake_ref(locked: &Value) -> Result<String> {
+    let json = serde_json::to_string(locked)?;
+    if json.contains("''") || json.contains("${") {
+        bail!("locked node cannot be quoted safely");
+    }
+    let expr = format!("builtins.flakeRefToString (builtins.fromJSON ''{json}'')");
+    eval_expr(&expr)?
+        .as_str()
+        .map(str::to_string)
+        .context("builtins.flakeRefToString did not return a string")
 }
 
 pub fn eval_expr(expr: &str) -> Result<Value> {

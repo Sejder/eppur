@@ -5,6 +5,7 @@ mod engine;
 mod git;
 mod graph;
 mod guard;
+mod inputs;
 mod lock;
 mod log;
 mod logparse;
@@ -67,6 +68,9 @@ enum Command {
         #[command(flatten)]
         build: cmd::BuildArgs,
     },
+    /// Run nix flake update, keeping a pinned flake input where it is until
+    /// its upstream has a new revision to try.
+    Update,
     /// List the pins and held hosts and homes, with their age.
     Status {
         /// Print a JSON summary for dashboards and scripts instead.
@@ -116,7 +120,7 @@ enum Command {
     /// that still fails is pinned again by the next run.
     #[command(
         visible_alias = "unpin",
-        group = clap::ArgGroup::new("what").required(true).args(["attr", "held"])
+        group = clap::ArgGroup::new("what").required(true).args(["attr", "held", "flake_input"])
     )]
     Clear {
         #[command(flatten)]
@@ -131,9 +135,15 @@ enum Command {
         /// with the current lock.
         #[arg(long, conflicts_with_all = ["attr", "input"])]
         held: bool,
+        /// Remove the pin of this flake input instead. flake.lock stays as it
+        /// is until the next update moves the input; if it still fails then,
+        /// it is pinned again.
+        #[arg(long, value_name = "INPUT", conflicts_with_all = ["attr", "input", "held"])]
+        flake_input: Option<String>,
     },
     /// Fold another pins.json into the flake's; per host or home, the entry
-    /// from the newer lock wins.
+    /// for the flake's own lock or else from the newer lock wins, and the
+    /// flake input pins changed last are taken whole.
     Merge {
         /// Another pins.json, e.g. one published by a build host.
         #[arg(value_name = "FILE")]
@@ -155,6 +165,7 @@ fn main() -> ExitCode {
         Command::Build { build } => cmd::reconcile(at, build, cmd::Activation::None),
         Command::Switch { build } => cmd::reconcile(at, build, cmd::Activation::Switch),
         Command::Boot { build } => cmd::reconcile(at, build, cmd::Activation::Boot),
+        Command::Update => cmd::update(at),
         Command::Merge { file } => cmd::merge(at, file),
         Command::Status { json } => cmd::status(at, *json),
         Command::Why { pick, attr } => cmd::why(at, pick, attr),
@@ -170,7 +181,11 @@ fn main() -> ExitCode {
             attr,
             input,
             held,
-        } => cmd::clear(at, pick, attr.as_deref(), input.as_deref(), *held),
+            flake_input,
+        } => match flake_input {
+            Some(name) => cmd::clear_input(at, name),
+            None => cmd::clear(at, pick, attr.as_deref(), input.as_deref(), *held),
+        },
     };
     result.unwrap_or_else(|e| {
         log::flush_nix_errors();

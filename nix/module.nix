@@ -176,8 +176,10 @@ in
           switcher
           input
           donors
+          inputDeny
           retrySameDerivationAfterDays
           ;
+        packageSets = builtins.attrNames cfg.nixpkgs;
       };
     })
     (lib.mkIf (cfg.enable && up.enable) {

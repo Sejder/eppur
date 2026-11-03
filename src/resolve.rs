@@ -29,7 +29,7 @@ pub fn is_attr_name(s: &str) -> bool {
     ATTR.is_match(s)
 }
 
-fn glob(pattern: &str, s: &str) -> bool {
+pub fn glob(pattern: &str, s: &str) -> bool {
     match pattern.strip_suffix('*') {
         Some(prefix) => s.starts_with(prefix),
         None => s == pattern,
