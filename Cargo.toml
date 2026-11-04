@@ -1,11 +1,11 @@
 [package]
-name = "nixheal"
+name = "eppur"
 version = "0.1.5"
 edition = "2024"
 description = "Pin NixOS packages that fail to build to their last good nixpkgs, and unpin them once they build again"
 license = "MIT"
-repository = "https://github.com/Sejder/nixheal"
-homepage = "https://github.com/Sejder/nixheal"
+repository = "https://github.com/Sejder/eppur"
+homepage = "https://github.com/Sejder/eppur"
 readme = "README.md"
 keywords = ["nix", "nixos", "flake", "update"]
 categories = ["command-line-utilities"]

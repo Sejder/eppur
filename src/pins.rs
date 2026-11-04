@@ -55,7 +55,7 @@ pub struct Pin {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     /// Whether the machine's own overlays apply to the pinned copy; missing
-    /// for pins made before nixheal checked, which get none.
+    /// for pins made before eppur checked, which get none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overlays: Option<bool>,
     pub checked_nar_hash: String,
@@ -219,7 +219,7 @@ pub struct PinsFile {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub inputs: BTreeMap<String, InputPin>,
     /// When `inputs` last changed, in seconds: it is one decision about one
-    /// lock, so `nixheal merge` takes the newer map whole, an emptied one too.
+    /// lock, so `eppur merge` takes the newer map whole, an emptied one too.
     #[serde(default, rename = "inputsChanged", skip_serializing_if = "is_zero")]
     pub inputs_changed: i64,
 }
@@ -247,7 +247,7 @@ impl PinsFile {
             Some(v) if v == VERSION as u64 => Ok(serde_json::from_value(json)?),
             Some(v) => bail!("pins file version {v} is not supported (expected {VERSION})"),
             None if json.as_object().is_some_and(|o| o.is_empty()) => Ok(Self::default()),
-            None => bail!("not a nixheal pins file (no version)"),
+            None => bail!("not an eppur pins file (no version)"),
         }
     }
 
@@ -323,7 +323,7 @@ impl PinsFile {
     }
 
     /// Put `entry` in place unless the file already holds one computed from a
-    /// newer lock: how `nixheal merge` combines two files, e.g. a fleet's
+    /// newer lock: how `eppur merge` combines two files, e.g. a fleet's
     /// published pins with a checkout's. Pins made by hand here that the
     /// incoming entry lacks are kept. Returns whether the entry was taken.
     #[cfg(test)]
@@ -594,7 +594,7 @@ mod tests {
     #[test]
     fn write_atomic_keeps_mode_and_ignores_planted_temp_names() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = std::env::temp_dir().join(format!("nixheal-wa-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("eppur-wa-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let target = dir.join("flake.lock");
         std::fs::write(&target, b"old").unwrap();
@@ -650,7 +650,7 @@ mod tests {
 
     #[test]
     fn write_atomic_writes_through_a_symlink() {
-        let dir = std::env::temp_dir().join(format!("nixheal-link-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("eppur-link-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let real = dir.join("real.json");
         let link = dir.join("pins.json");

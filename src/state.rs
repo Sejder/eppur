@@ -10,7 +10,18 @@ fn state_dir() -> Option<PathBuf> {
     std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
-        .map(|d| d.join("nixheal"))
+        .map(|d| state_dir_in(&d))
+}
+
+/// The state directory under `base`. One from when eppur was called nixheal is
+/// taken over, as its last good locks are what a failing package is pinned to.
+fn state_dir_in(base: &Path) -> PathBuf {
+    let dir = base.join("eppur");
+    let old = base.join("nixheal");
+    if !dir.exists() && old.is_dir() {
+        let _ = std::fs::rename(&old, &dir);
+    }
+    dir
 }
 
 pub fn key(text: &str) -> String {
@@ -79,6 +90,23 @@ pub fn save_last_good(flake: &Path, target: Option<&Target>, lock: &Lock) -> Res
 mod tests {
     use super::*;
     use crate::pins::Kind;
+
+    #[test]
+    fn takes_over_the_old_state_directory() {
+        let base = std::env::temp_dir().join(format!("eppur-state-{}", std::process::id()));
+        let old = base.join("nixheal");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("last-good.lock"), "{}").unwrap();
+        let dir = state_dir_in(&base);
+        assert!(dir.join("last-good.lock").exists());
+        assert!(!old.exists());
+
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join("stale.lock"), "{}").unwrap();
+        state_dir_in(&base);
+        assert!(!dir.join("stale.lock").exists());
+        std::fs::remove_dir_all(&base).unwrap();
+    }
 
     #[test]
     fn one_file_per_target() {

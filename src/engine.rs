@@ -36,10 +36,10 @@ pub struct Engine {
     /// The pins each target built with on its last good lock.
     pub last_good_pins: HashMap<Target, Entry>,
     pub targets: Vec<Target>,
-    /// The machine nixheal runs on, when it is one of the targets and must not
+    /// The machine eppur runs on, when it is one of the targets and must not
     /// be held: its failure aborts the run instead of holding it.
     pub guarded: Option<Target>,
-    /// The machine nixheal runs on, when it is one of the targets.
+    /// The machine eppur runs on, when it is one of the targets.
     pub local: Option<Target>,
     /// Where pins.json sits in the flake's source tree: "pins.json", or
     /// "dir/pins.json" for a flake in a subdirectory of its repository.
@@ -132,7 +132,7 @@ pub struct Report {
     pub rollback: Vec<Rollback>,
 }
 
-/// What a target's own programs.nixheal says, read before anything builds.
+/// What a target's own programs.eppur says, read before anything builds.
 #[derive(Debug, serde::Deserialize)]
 struct Probe {
     enable: bool,
@@ -241,9 +241,8 @@ impl Engine {
         // What each target needs evaluated before its first round, side by
         // side: each of these evaluates a whole configuration.
         let nix = &self.nix;
-        let probes = crate::nix::parallel_map(&self.targets, |t| {
-            nix.eval_apply(&t.nixheal_config(), PROBE)
-        });
+        let probes =
+            crate::nix::parallel_map(&self.targets, |t| nix.eval_apply(&t.eppur_config(), PROBE));
         let requests: Vec<(&Target, Vec<CopyRequest>)> = self
             .targets
             .iter()
@@ -627,7 +626,7 @@ impl Engine {
             }
             if names.is_empty() {
                 bail!(
-                    "programs.nixheal.{option} lists {}, but the flake has no {output}",
+                    "programs.eppur.{option} lists {}, but the flake has no {output}",
                     wanted
                         .iter()
                         .map(|t| t.name.as_str())
@@ -642,7 +641,7 @@ impl Engine {
                 .collect();
             if !missing.is_empty() {
                 bail!(
-                    "programs.nixheal.{option} lists {}, which {output} does not have (it has: {})",
+                    "programs.eppur.{option} lists {}, which {output} does not have (it has: {})",
                     missing.join(", "),
                     names.join(", ")
                 );
@@ -801,7 +800,7 @@ impl Engine {
     /// For a group of pins from one build failure whose inputs moved: the day
     /// from which it is retried anyway, when the package's drv is still the
     /// one that failed in every moved input. None when it should be retried
-    /// now, or nixheal cannot tell.
+    /// now, or eppur cannot tell.
     fn unchanged(
         &self,
         target: &Target,
@@ -858,7 +857,7 @@ impl Engine {
         let via = |with: bool| {
             self.nix
                 .eval_apply(
-                    &target.nixheal_config(),
+                    &target.eppur_config(),
                     &format!(
                         "c: if !(c ? importPinned) then {{ none = true; }} else let p = c.importPinned {{ locked = {literal}; overlays = {with}; }}; in {}",
                         resolve::copy_expr(attr)
@@ -937,7 +936,7 @@ impl Engine {
     }
 
     /// `pin` with the version of the package it provides filled in, when
-    /// nixheal can evaluate it.
+    /// eppur can evaluate it.
     fn versioned(&self, st: &State, attr: &str, mut pin: Pin) -> Pin {
         if pin.version.is_none() {
             pin.version = self
@@ -969,8 +968,8 @@ impl Engine {
         }
     }
 
-    /// Check that the target applies the pins nixheal writes for it, and return
-    /// its package sets. A nixheal setting that would make every pin silently
+    /// Check that the target applies the pins eppur writes for it, and return
+    /// its package sets. An eppur setting that would make every pin silently
     /// do nothing stops the run. A configuration that does not evaluate at all,
     /// such as one setting an option the update removed, is that target's
     /// problem: it comes back as the reason to hold it.
@@ -979,10 +978,10 @@ impl Engine {
             Ok(v) => serde_json::from_value(v)?,
             Err(e) => {
                 let text = e.to_string();
-                if text.contains("attribute 'nixheal' missing")
+                if text.contains("attribute 'eppur' missing")
                     || text.contains("attribute 'programs' missing")
                 {
-                    bail!("{target} has no programs.nixheal; import the nixheal module there");
+                    bail!("{target} has no programs.eppur; import the eppur module there");
                 }
                 return Ok(Err(format!(
                     "its configuration does not evaluate: {}",
@@ -991,20 +990,20 @@ impl Engine {
             }
         };
         if !probe.enable {
-            bail!("programs.nixheal.enable is off in {target}, so its pins would not be applied");
+            bail!("programs.eppur.enable is off in {target}, so its pins would not be applied");
         }
         if probe.name != target.name {
             bail!(
-                "{target} has programs.nixheal.name = \"{}\"; it must be \"{}\", its configuration's name, or its pins are never applied",
+                "{target} has programs.eppur.name = \"{}\"; it must be \"{}\", its configuration's name, or its pins are never applied",
                 probe.name,
                 target.name
             );
         }
         match probe.pins.as_deref().map(flake_relative) {
-            None => bail!("programs.nixheal.pinsFile is not set in {target}"),
+            None => bail!("programs.eppur.pinsFile is not set in {target}"),
             Some(Some(rel)) if rel == self.pins_rel => {}
             Some(rel) => bail!(
-                "{target} has programs.nixheal.pinsFile = {}; it must be {}, the pins.json next to flake.lock, where nixheal writes it",
+                "{target} has programs.eppur.pinsFile = {}; it must be {}, the pins.json next to flake.lock, where eppur writes it",
                 rel.unwrap_or_else(|| probe.pins.clone().unwrap_or_default()),
                 self.pins_rel
             ),
@@ -1153,7 +1152,7 @@ impl Engine {
                 // none is held for it.
                 if not_built.is_empty() {
                     bail!(
-                        "the build failed without naming a derivation, so nixheal cannot tell which host it affects; nothing was pinned or held: {why}"
+                        "the build failed without naming a derivation, so eppur cannot tell which host it affects; nothing was pinned or held: {why}"
                     );
                 }
                 for (i, top) in &built {
@@ -2011,7 +2010,7 @@ impl Engine {
     }
 
     /// Warn about a pin older than warnAfterDays; younger ones are left to
-    /// nixheal status.
+    /// eppur status.
     fn log_age(&self, target: &Target, attr: &str, pin: &Pin) {
         match date::parse(&pin.since).map(|d| self.today - d) {
             Some(days) if days > self.warn_after_days && pin.reason != Reason::Manual => {
@@ -2092,7 +2091,7 @@ fn fetch_copies(nix: &Nix, target: &Target, requests: &[CopyRequest]) -> Vec<(St
         "c: if !(c ? importPinned) then null else [ {} ]",
         imports.join(" ")
     );
-    let Ok(Value::Array(results)) = nix.eval_apply(&target.nixheal_config(), &apply) else {
+    let Ok(Value::Array(results)) = nix.eval_apply(&target.eppur_config(), &apply) else {
         return Vec::new();
     };
     let mut found = Vec::new();
@@ -2203,7 +2202,7 @@ fn flake_relative(path: &str) -> Option<String> {
 }
 
 /// Whether a new pin of `attr` from `locked` should carry the target's own
-/// overlays: with programs.nixheal.pinnedOverlays on, yes when the overlaid
+/// overlays: with programs.eppur.pinnedOverlays on, yes when the overlaid
 /// copy evaluates on the old nixpkgs; a warning says when they are left out
 /// and change the package. None when the target cannot tell (no
 /// importPinned, e.g. a hand-written configuration).
@@ -2222,7 +2221,7 @@ pub fn choose_overlays(
     // is an error tryEval cannot catch.
     let probe = |with: bool| {
         nix.eval_apply(
-            &target.nixheal_config(),
+            &target.eppur_config(),
             &format!(
                 "c: if !(c ? importPinned) then null else {{ carry = c.pinnedOverlays or true; out = (c.importPinned {{ locked = {literal}; overlays = {with}; }}).{attr}.outPath; }}"
             ),

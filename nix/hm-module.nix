@@ -7,9 +7,9 @@ self:
   ...
 }:
 let
-  cfg = config.programs.nixheal;
+  cfg = config.programs.eppur;
   inNixos = osConfig != null;
-  osCfg = if inNixos then osConfig.programs.nixheal or { } else { };
+  osCfg = if inNixos then osConfig.programs.eppur or { } else { };
   globalPkgs = inNixos && (osConfig.home-manager.useGlobalPkgs or false);
   nhFlake = config.programs.nh.flake or null;
 
@@ -36,7 +36,7 @@ let
     )
   ) cfg.nixpkgs;
 
-  runsNixheal = !inNixos && (cfg.hosts != [ ] || cfg.homes != [ ]);
+  runsEppur = !inNixos && (cfg.hosts != [ ] || cfg.homes != [ ]);
   upCommit = if cfg.autoUpgrade.commit == null then cfg.commit else cfg.autoUpgrade.commit;
   hmNixpkgsConfig =
     let
@@ -53,7 +53,11 @@ let
   ];
 in
 {
-  options.programs.nixheal = import ./options.nix {
+  imports = [
+    (lib.mkRemovedOptionModule [ "programs" "nixheal" ] "nixheal was renamed: use the eppur flake (github:Sejder/eppur) and programs.eppur.")
+  ];
+
+  options.programs.eppur = import ./options.nix {
     inherit lib self pkgs;
     defaultName = if inNixos then osCfg.name or osConfig.networking.hostName else config.home.username;
     defaultEnable = osCfg.enable or false;
@@ -68,12 +72,12 @@ in
       assertions = [
         {
           assertion = false;
-          message = "programs.nixheal.autoUpgrade needs programs.nixheal.enable";
+          message = "programs.eppur.autoUpgrade needs programs.eppur.enable";
         }
       ];
     })
     {
-      programs.nixheal.importPinned =
+      programs.eppur.importPinned =
         { locked, overlays }:
         import ./import-pinned.nix {
           config =
@@ -84,13 +88,13 @@ in
           inherit locked;
           overlays = if overlays then marked.before (pkgs.overlays or [ ]) else [ ];
         };
-      programs.nixheal.packageSets = {
+      programs.eppur.packageSets = {
         ${cfg.input} = pkgs;
       }
       // extraSets;
       warnings = lib.optional (
         inNixos && (cfg.hosts != [ ] || cfg.homes != [ ] || cfg.autoUpgrade.enable)
-      ) "programs.nixheal.hosts, homes and autoUpgrade in Home Manager only apply to a standalone Home Manager; inside NixOS, set them in the NixOS configuration";
+      ) "programs.eppur.hosts, homes and autoUpgrade in Home Manager only apply to a standalone Home Manager; inside NixOS, set them in the NixOS configuration";
       _module.args = lib.mapAttrs' (input: set: lib.nameValuePair set.argName extraSets.${input}) (
         lib.filterAttrs (
           _: set: set.argName != null && !(builtins.elem set.argName reservedArgs)
@@ -101,28 +105,28 @@ in
       assertions = [
         {
           assertion = cfg.pinsFile != null;
-          message = "programs.nixheal.pinsFile must point at the flake's pins.json";
+          message = "programs.eppur.pinsFile must point at the flake's pins.json";
         }
         {
           assertion =
             cfg.pinsFile == null
             || builtins.isPath cfg.pinsFile
             || lib.hasPrefix "${builtins.storeDir}/" (toString cfg.pinsFile);
-          message = "programs.nixheal.pinsFile must be a path such as ./pins.json, not a string";
+          message = "programs.eppur.pinsFile must be a path such as ./pins.json, not a string";
         }
       ]
       ++ lib.mapAttrsToList (input: set: {
         assertion = set.argName == null || !(builtins.elem set.argName reservedArgs);
-        message = "programs.nixheal.nixpkgs.${input}.argName = \"${toString set.argName}\" would shadow a module argument";
+        message = "programs.eppur.nixpkgs.${input}.argName = \"${toString set.argName}\" would shadow a module argument";
       }) cfg.nixpkgs;
       nixpkgs.overlays = lib.mkAfter [ (overlay cfg.input (config.nixpkgs.config or null)) ];
     })
-    (lib.mkIf (cfg.enable && runsNixheal) {
+    (lib.mkIf (cfg.enable && runsEppur) {
       home.packages = [
         cfg.package
       ]
       ++ lib.optional (cfg.switcher == "nh" && !(config.programs.nh.enable or false)) pkgs.nh;
-      xdg.configFile."nixheal.json".text = builtins.toJSON {
+      xdg.configFile."eppur.json".text = builtins.toJSON {
         kind = "home";
         self = cfg.name;
         inherit (cfg)
@@ -142,29 +146,29 @@ in
         packageSets = builtins.attrNames cfg.nixpkgs;
       };
     })
-    (lib.mkIf (cfg.enable && cfg.autoUpgrade.enable && !inNixos && !runsNixheal) {
+    (lib.mkIf (cfg.enable && cfg.autoUpgrade.enable && !inNixos && !runsEppur) {
       assertions = [
         {
           assertion = false;
-          message = "programs.nixheal.autoUpgrade needs this home (${cfg.name}) in programs.nixheal.homes";
+          message = "programs.eppur.autoUpgrade needs this home (${cfg.name}) in programs.eppur.homes";
         }
       ];
     })
-    (lib.mkIf (cfg.enable && cfg.autoUpgrade.enable && runsNixheal) {
+    (lib.mkIf (cfg.enable && cfg.autoUpgrade.enable && runsEppur) {
       assertions = [
         {
           assertion = builtins.elem cfg.name cfg.homes;
-          message = "programs.nixheal.autoUpgrade needs this home (${cfg.name}) in programs.nixheal.homes";
+          message = "programs.eppur.autoUpgrade needs this home (${cfg.name}) in programs.eppur.homes";
         }
         {
           assertion = cfg.flake != null;
-          message = "programs.nixheal.autoUpgrade needs programs.nixheal.flake";
+          message = "programs.eppur.autoUpgrade needs programs.eppur.flake";
         }
       ];
 
-      systemd.user.services.nixheal-upgrade = {
+      systemd.user.services.eppur-upgrade = {
         Unit = {
-          Description = "Update the flake with nixheal and switch Home Manager";
+          Description = "Update the flake with eppur and switch Home Manager";
           OnFailure = cfg.autoUpgrade.onFailure;
           X-SwitchMethod = "keep-old";
         };
@@ -177,7 +181,7 @@ in
                 pkgs.openssh
               ]
             }:/run/current-system/sw/bin:/nix/var/nix/profiles/default/bin:/usr/bin:/bin"
-            "NIXHEAL_CONFIG=${config.xdg.configHome or "${config.home.homeDirectory}/.config"}/nixheal.json"
+            "EPPUR_CONFIG=${config.xdg.configHome or "${config.home.homeDirectory}/.config"}/eppur.json"
           ];
           ExecStart = lib.escapeShellArgs (
             [
@@ -195,8 +199,8 @@ in
         };
       };
 
-      systemd.user.timers.nixheal-upgrade = {
-        Unit.Description = "Scheduled nixheal upgrade";
+      systemd.user.timers.eppur-upgrade = {
+        Unit.Description = "Scheduled eppur upgrade";
         Install.WantedBy = [ "timers.target" ];
         Timer = {
           OnCalendar = cfg.autoUpgrade.dates;

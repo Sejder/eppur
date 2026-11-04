@@ -4,8 +4,8 @@ use serde::Deserialize;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-/// What the NixOS or Home Manager module writes to /etc/nixheal.json or
-/// ~/.config/nixheal.json.
+/// What the NixOS or Home Manager module writes to /etc/eppur.json or
+/// ~/.config/eppur.json.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Config {
@@ -63,7 +63,7 @@ fn default_retry_same_after_days() -> i64 {
     7
 }
 
-pub const ROOT_PREFIX: &str = "nixheal-";
+pub const ROOT_PREFIX: &str = "eppur-";
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Target {
@@ -99,7 +99,7 @@ impl Target {
     }
 
     /// The name of this target's GC root under --gc-roots. The prefix marks
-    /// the roots nixheal made, the only ones it ever removes there.
+    /// the roots eppur made, the only ones it ever removes there.
     pub fn root_name(&self) -> String {
         match self.kind {
             Kind::Nixos => format!("{ROOT_PREFIX}host-{}", self.name),
@@ -107,12 +107,12 @@ impl Target {
         }
     }
 
-    pub fn nixheal_config(&self) -> String {
-        format!("{}.config.programs.nixheal", self.base())
+    pub fn eppur_config(&self) -> String {
+        format!("{}.config.programs.eppur", self.base())
     }
 
     pub fn package_sets(&self) -> String {
-        format!("{}.config.programs.nixheal.packageSets", self.base())
+        format!("{}.config.programs.eppur.packageSets", self.base())
     }
 }
 
@@ -144,14 +144,14 @@ fn user_config() -> Option<PathBuf> {
     let base = std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".config")))?;
-    Some(base.join("nixheal.json"))
+    Some(base.join("eppur.json"))
 }
 
 /// Where the config in effect is, and whether it was asked for: an explicit
-/// path, then $NIXHEAL_CONFIG, then the Home Manager file, then the NixOS one.
+/// path, then $EPPUR_CONFIG, then the Home Manager file, then the NixOS one.
 pub struct Located {
     pub path: PathBuf,
-    /// Named by --config or $NIXHEAL_CONFIG, so it must work.
+    /// Named by --config or $EPPUR_CONFIG, so it must work.
     pub explicit: bool,
     /// Where the path came from, for error messages.
     pub from: &'static str,
@@ -165,14 +165,14 @@ pub fn locate(explicit: Option<&Path>) -> Option<Located> {
             from: "--config",
         });
     }
-    if let Some(p) = std::env::var_os("NIXHEAL_CONFIG") {
+    if let Some(p) = std::env::var_os("EPPUR_CONFIG") {
         return Some(Located {
             path: PathBuf::from(p),
             explicit: true,
-            from: "$NIXHEAL_CONFIG",
+            from: "$EPPUR_CONFIG",
         });
     }
-    [user_config(), Some(PathBuf::from("/etc/nixheal.json"))]
+    [user_config(), Some(PathBuf::from("/etc/eppur.json"))]
         .into_iter()
         .flatten()
         .find(|p| p.exists())
@@ -188,10 +188,10 @@ pub fn read(path: &Path) -> Result<Config> {
     Config::parse(&bytes).with_context(|| format!("parsing {}", path.display()))
 }
 
-/// What `nixheal` with no config at all says.
+/// What `eppur` with no config at all says.
 pub fn missing() -> anyhow::Error {
     anyhow::anyhow!(
-        "no nixheal config: set programs.nixheal.enable and hosts (or homes) and switch once, which writes /etc/nixheal.json (~/.config/nixheal.json for Home Manager), or pass --config FILE"
+        "no eppur config: set programs.eppur.enable and hosts (or homes) and switch once, which writes /etc/eppur.json (~/.config/eppur.json for Home Manager), or pass --config FILE"
     )
 }
 
@@ -228,13 +228,13 @@ mod tests {
         );
         assert_eq!(
             h.package_sets(),
-            "nixosConfigurations.\"laptop\".config.programs.nixheal.packageSets"
+            "nixosConfigurations.\"laptop\".config.programs.eppur.packageSets"
         );
         assert_eq!(h.to_string(), "host laptop");
-        assert_eq!(h.root_name(), "nixheal-host-laptop");
+        assert_eq!(h.root_name(), "eppur-host-laptop");
         assert_eq!(
             Target::new(Kind::Home, "laptop").root_name(),
-            "nixheal-home-laptop"
+            "eppur-home-laptop"
         );
         let m = Target::new(Kind::Home, "alice@wsl");
         assert_eq!(

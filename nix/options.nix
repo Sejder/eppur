@@ -34,13 +34,13 @@ in
   enable = mkOption {
     type = types.bool;
     default = defaultEnable;
-    description = "Apply this machine's nixheal pins, and install nixheal when it builds hosts or homes.";
+    description = "Apply this machine's eppur pins, and install eppur when it builds hosts or homes.";
   };
   package = mkOption {
     type = types.package;
     default = self.packages.${pkgs.stdenv.hostPlatform.system}.default;
-    defaultText = lib.literalExpression "nixheal.packages.\${system}.default";
-    description = "The nixheal package.";
+    defaultText = lib.literalExpression "eppur.packages.\${system}.default";
+    description = "The eppur package.";
   };
   input = mkOption {
     type = types.str;
@@ -52,7 +52,7 @@ in
     type = types.nullOr types.path;
     default = defaultPinsFile;
     example = lib.literalExpression "./pins.json";
-    description = "The flake's pins.json. It may not exist yet; nixheal creates it.";
+    description = "The flake's pins.json. It may not exist yet; eppur creates it.";
   };
   name = mkOption {
     type = types.str;
@@ -62,17 +62,17 @@ in
   flake = mkOption {
     type = types.nullOr types.str;
     default = defaultFlake;
-    description = "Path of the flake checkout that nixheal updates.";
+    description = "Path of the flake checkout that eppur updates.";
   };
   hosts = mkOption {
     type = types.listOf types.str;
     default = [ ];
-    description = "nixosConfigurations that nixheal builds and pins when it runs here.";
+    description = "nixosConfigurations that eppur builds and pins when it runs here.";
   };
   homes = mkOption {
     type = types.listOf types.str;
     default = [ ];
-    description = "homeConfigurations that nixheal builds and pins when it runs here.";
+    description = "homeConfigurations that eppur builds and pins when it runs here.";
   };
   warnAfterDays = mkOption {
     type = types.ints.unsigned;
@@ -108,10 +108,10 @@ in
       "native"
     ];
     default = "nh";
-    description = "How nixheal switch and boot activate: nh, or native (nixos-rebuild for hosts, home-manager for homes).";
+    description = "How eppur switch and boot activate: nh, or native (nixos-rebuild for hosts, home-manager for homes).";
   };
   autoUpgrade = {
-    enable = lib.mkEnableOption "a timer that updates the flake with nixheal and activates the result";
+    enable = lib.mkEnableOption "a timer that updates the flake with eppur and activates the result";
     dates = mkOption {
       type = types.str;
       default = "04:40";
@@ -137,7 +137,7 @@ in
     commit = mkOption {
       type = types.nullOr types.bool;
       default = null;
-      description = "Commit flake.lock and pins.json after each timer run; null follows programs.nixheal.commit.";
+      description = "Commit flake.lock and pins.json after each timer run; null follows programs.eppur.commit.";
     };
     onFailure = mkOption {
       type = types.listOf types.str;
@@ -154,13 +154,13 @@ in
   pinnedOverlays = mkOption {
     type = types.bool;
     default = true;
-    description = "Apply this machine's own nixpkgs overlays (those ordered before nixheal's) to pinned packages, so a pinned package keeps your patches. A pin is made without them when they do not evaluate against the old nixpkgs, with a warning.";
+    description = "Apply this machine's own nixpkgs overlays (those ordered before eppur's) to pinned packages, so a pinned package keeps your patches. A pin is made without them when they do not evaluate against the old nixpkgs, with a warning.";
   };
   importPinned = mkOption {
     type = types.raw;
     readOnly = true;
     internal = true;
-    description = "How this machine imports a pinned nixpkgs, for nixheal's checks: { locked, overlays }: pkgs, with overlays a bool.";
+    description = "How this machine imports a pinned nixpkgs, for eppur's checks: { locked, overlays }: pkgs, with overlays a bool.";
   };
   commit = mkOption {
     type = types.bool;
@@ -183,6 +183,6 @@ in
   packageSets = mkOption {
     type = types.attrsOf types.raw;
     readOnly = true;
-    description = "Every package set nixheal pins on this machine, keyed by flake input.";
+    description = "Every package set eppur pins on this machine, keyed by flake input.";
   };
 }

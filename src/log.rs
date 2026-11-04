@@ -50,23 +50,23 @@ fn journal() -> bool {
 /// Progress; hidden with --quiet.
 pub fn info(msg: &str) {
     if !is_quiet() {
-        eprintln!("nixheal: {msg}");
+        eprintln!("eppur: {msg}");
     }
 }
 
 /// Reasoning that only matters when debugging; shown only with --verbose.
 pub fn detail(msg: &str) {
     if VERBOSE.load(Ordering::Relaxed) {
-        eprintln!("nixheal: {msg}");
+        eprintln!("eppur: {msg}");
     }
 }
 
-/// A pin, unpin, hold or release, or why nixheal gave up; always shown.
+/// A pin, unpin, hold or release, or why eppur gave up; always shown.
 pub fn change(msg: &str) {
     if DRY_RUN.load(Ordering::Relaxed) {
-        eprintln!("nixheal: (dry run) {msg}");
+        eprintln!("eppur: (dry run) {msg}");
     } else {
-        eprintln!("nixheal: {msg}");
+        eprintln!("eppur: {msg}");
     }
 }
 
@@ -79,7 +79,7 @@ pub fn nix_progress(msg: &str) {
 }
 
 /// An error message forwarded from nix. With --quiet it is held back, and
-/// only shown when nixheal could not handle it (see flush_nix_errors).
+/// only shown when eppur could not handle it (see flush_nix_errors).
 pub fn nix_error(msg: &str) {
     if is_quiet() {
         if let Ok(mut held) = HELD_BACK.lock() {
@@ -100,7 +100,7 @@ pub fn flush_nix_errors() {
     }
 }
 
-/// Drop the nix errors held back under --quiet: nixheal handled them.
+/// Drop the nix errors held back under --quiet: eppur handled them.
 pub fn discard_nix_errors() {
     if let Ok(mut held) = HELD_BACK.lock() {
         held.clear();
@@ -110,8 +110,8 @@ pub fn discard_nix_errors() {
 /// Logged at warning priority when stderr goes to the journal.
 pub fn warn(msg: &str) {
     if journal() {
-        eprintln!("<4>nixheal: warning: {msg}");
+        eprintln!("<4>eppur: warning: {msg}");
     } else {
-        eprintln!("nixheal: warning: {msg}");
+        eprintln!("eppur: warning: {msg}");
     }
 }

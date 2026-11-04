@@ -491,6 +491,17 @@ pub fn add_root(drv: &str, link: &Path) -> Result<()> {
     checked(&format!("rooting {drv}"), run(cmd, "nix build")?).map(|_| ())
 }
 
+/// Root a path that is already in the store under `link`.
+pub fn add_path_root(path: &Path, link: &Path) -> Result<()> {
+    let mut cmd = command();
+    cmd.args(["build", "--out-link"]).arg(link).arg(path);
+    checked(
+        &format!("rooting {}", path.display()),
+        run(cmd, "nix build")?,
+    )
+    .map(|_| ())
+}
+
 /// Whether every output of `drv` is in the store, i.e. it really built.
 pub fn is_built(drv: &str) -> Result<bool> {
     let mut cmd = command();

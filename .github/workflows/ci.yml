@@ -28,4 +28,4 @@ jobs:
           nix build -L .#default
           git config --global user.name ci
           git config --global user.email ci@localhost
-          NIXHEAL="$PWD/result/bin/nixheal" tests/e2e.sh
+          EPPUR="$PWD/result/bin/eppur" tests/e2e.sh

@@ -25,7 +25,7 @@
         in
         {
           default = pkgs.rustPlatform.buildRustPackage {
-            pname = "nixheal";
+            pname = "eppur";
             version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).package.version;
             src = pkgs.lib.fileset.toSource {
               root = ./.;
@@ -39,9 +39,9 @@
             cargoLock.lockFile = ./Cargo.lock;
             nativeBuildInputs = [ pkgs.makeWrapper ];
             postInstall = ''
-              wrapProgram $out/bin/nixheal --suffix PATH : ${pkgs.lib.makeBinPath [ pkgs.nix-output-monitor ]}
+              wrapProgram $out/bin/eppur --suffix PATH : ${pkgs.lib.makeBinPath [ pkgs.nix-output-monitor ]}
             '';
-            meta.mainProgram = "nixheal";
+            meta.mainProgram = "eppur";
           };
         }
       );
@@ -123,7 +123,7 @@
               {
                 nixpkgs.pkgs = pkgs;
                 networking.hostName = "test";
-                programs.nixheal = {
+                programs.eppur = {
                   enable = true;
                   pinsFile = pins;
                 };
@@ -142,7 +142,7 @@
               self.nixosModules.default
               {
                 networking.hostName = "test";
-                programs.nixheal = {
+                programs.eppur = {
                   enable = true;
                   pinsFile = pins;
                   hosts = [ "test" ];
@@ -185,8 +185,8 @@
               )
             ];
           };
-          settings = builtins.fromJSON machine.config.environment.etc."nixheal.json".text;
-          upgrade = machine.config.systemd.services.nixheal-upgrade;
+          settings = builtins.fromJSON machine.config.environment.etc."eppur.json".text;
+          upgrade = machine.config.systemd.services.eppur-upgrade;
 
           # Home Manager itself is not an input; these stand in for the few of
           # its options the module uses.
@@ -245,7 +245,7 @@
               {
                 _module.args.pkgs = pkgs;
                 home.username = "alice";
-                programs.nixheal = {
+                programs.eppur = {
                   enable = true;
                   pinsFile = pins;
                   homes = [ "alice" ];
@@ -253,6 +253,17 @@
                   autoUpgrade.enable = true;
                   nixpkgs.extra.source = nixpkgs;
                 };
+              }
+            ];
+          };
+          oldName = nixpkgs.lib.evalModules {
+            modules = [
+              hmStub
+              self.homeManagerModules.default
+              {
+                _module.args.pkgs = pkgs;
+                home.username = "alice";
+                programs.nixheal.enable = true;
               }
             ];
           };
@@ -265,7 +276,7 @@
                 _module.args.osConfig = {
                   networking.hostName = "alice-laptop";
                   home-manager.useGlobalPkgs = false;
-                  programs.nixheal = {
+                  programs.eppur = {
                     enable = true;
                     name = "laptop";
                     input = "nixos";
@@ -282,7 +293,7 @@
               self.nixosModules.default
               {
                 networking.hostName = "test";
-                programs.nixheal = {
+                programs.eppur = {
                   enable = true;
                   pinsFile = pins;
                   nixpkgs.extra = {
@@ -299,9 +310,9 @@
               }
             ];
           };
-          probe = machine.config.programs.nixheal;
-          homeSettings = builtins.fromJSON home.config.xdg.configFile."nixheal.json".text;
-          homeUpgrade = home.config.systemd.user.services.nixheal-upgrade;
+          probe = machine.config.programs.eppur;
+          homeSettings = builtins.fromJSON home.config.xdg.configFile."eppur.json".text;
+          homeUpgrade = home.config.systemd.user.services.eppur-upgrade;
           failedAssertions = cfg: builtins.filter (a: !a.assertion) cfg.assertions;
         in
         {
@@ -349,22 +360,22 @@
               };
             assert (onReal pkgs.pkgsLLVM).hello.drvPath == pkgs.pkgsLLVM.hello.drvPath;
             assert (onReal tuned).hello.drvPath == tuned.hello.drvPath;
-            pkgs.runCommand "nixheal-overlay-check" { } "touch $out";
+            pkgs.runCommand "eppur-overlay-check" { } "touch $out";
           module =
             assert machine.pkgs.hello.pname == "hello";
             assert machine.pkgs.cowsay.pname == "cowsay-local";
             assert machine.pkgs.figlet.pname == "figlet-local-x";
             assert
-              (machine.config.programs.nixheal.importPinned {
+              (machine.config.programs.eppur.importPinned {
                 inherit locked;
                 overlays = true;
               }).figlet.pname == "figlet-local";
             assert
-              (machine.config.programs.nixheal.importPinned {
+              (machine.config.programs.eppur.importPinned {
                 inherit locked;
                 overlays = false;
               }).figlet.pname == "figlet";
-            assert machine.config.programs.nixheal.packageSets ? extra;
+            assert machine.config.programs.eppur.packageSets ? extra;
             assert machine.config.environment.etc."extra-hello".text == "hello";
             assert settings.self == "test";
             assert settings.kind == "nixos";
@@ -372,13 +383,13 @@
             assert settings.switcher == "nh";
             assert settings.commit == false;
             assert upgrade.serviceConfig.User == "alice";
-            assert builtins.match ".*nixheal build --built-link /run/nixheal/system --no-commit --timeout 12h --update nixpkgs" upgrade.serviceConfig.ExecStart != null;
-            assert builtins.match "[+]/nix/store/.*-nixheal-activate" upgrade.serviceConfig.ExecStartPost != null;
-            assert machine.config.systemd.timers.nixheal-upgrade.timerConfig.OnCalendar == "04:40";
+            assert builtins.match ".*eppur build --built-link /run/eppur/system --no-commit --timeout 12h --update nixpkgs" upgrade.serviceConfig.ExecStart != null;
+            assert builtins.match "[+]/nix/store/.*-eppur-activate" upgrade.serviceConfig.ExecStartPost != null;
+            assert machine.config.systemd.timers.eppur-upgrade.timerConfig.OnCalendar == "04:40";
             assert !(settings ? inputs);
-            assert machine.config.programs.nixheal.packageSets ? nixpkgs;
+            assert machine.config.programs.eppur.packageSets ? nixpkgs;
             assert settings.input == "nixpkgs";
-            assert upgrade.environment.NIXHEAL_CONFIG == "/etc/nixheal.json";
+            assert upgrade.environment.EPPUR_CONFIG == "/etc/eppur.json";
             assert upgrade.unitConfig.OnFailure == [ ];
             assert upgrade.unitConfig.X-StopOnRemoval == false;
             assert !(upgrade.serviceConfig ? TimeoutStartSec);
@@ -389,48 +400,51 @@
             assert probe.enable && probe.name == "test";
             assert nixpkgs.lib.hasSuffix "-pins.json" (toString probe.pinsFile);
             assert builtins.attrNames probe.packageSets == [ "extra" "nixpkgs" ];
-            assert builtins.elem machine.config.programs.nixheal.package machine.config.environment.systemPackages;
-            pkgs.runCommand "nixheal-module-check" { } "touch $out";
+            assert builtins.elem machine.config.programs.eppur.package machine.config.environment.systemPackages;
+            pkgs.runCommand "eppur-module-check" { } "touch $out";
           activate-refuses =
             let
-              script = nixpkgs.lib.removePrefix "+" machine.config.systemd.services.nixheal-upgrade.serviceConfig.ExecStartPost;
+              script = nixpkgs.lib.removePrefix "+" machine.config.systemd.services.eppur-upgrade.serviceConfig.ExecStartPost;
             in
-            pkgs.runCommand "nixheal-activate-check" { } ''
+            pkgs.runCommand "eppur-activate-check" { } ''
               mkdir -p fake/bin
               ln -s "$PWD/fake" outside
-              if NIXHEAL_BUILT_LINK="$PWD/outside" ${script} 2>err; then
+              if EPPUR_BUILT_LINK="$PWD/outside" ${script} 2>err; then
                 echo "activated a system outside the store"; exit 1
               fi
               grep -q "not in /nix/store" err
               ln -s ${pkgs.hello} notnixos
-              if NIXHEAL_BUILT_LINK="$PWD/notnixos" ${script} 2>err; then
+              if EPPUR_BUILT_LINK="$PWD/notnixos" ${script} 2>err; then
                 echo "activated a store path that is not a NixOS system"; exit 1
               fi
               grep -q "not a NixOS system" err
-              NIXHEAL_BUILT_LINK="$PWD/missing" ${script}
+              EPPUR_BUILT_LINK="$PWD/missing" ${script}
               touch $out
             '';
           home-module =
             assert failedAssertions home.config == [ ];
-            assert home.config.programs.nixheal.name == "alice";
+            assert home.config.programs.eppur.name == "alice";
+            assert builtins.any (a: nixpkgs.lib.hasInfix "use the eppur flake" a.message) (
+              failedAssertions oldName.config
+            );
             assert homeSettings.kind == "home";
             assert homeSettings.self == "alice";
             assert homeSettings.homes == [ "alice" ];
             assert builtins.length home.config.nixpkgs.overlays == 1;
-            assert home.config.programs.nixheal.packageSets ? nixpkgs;
-            assert builtins.match ".*nixheal switch --no-commit --timeout 12h --update" homeUpgrade.Service.ExecStart != null;
+            assert home.config.programs.eppur.packageSets ? nixpkgs;
+            assert builtins.match ".*eppur switch --no-commit --timeout 12h --update" homeUpgrade.Service.ExecStart != null;
             assert !(homeUpgrade.Unit ? After);
             assert homeUpgrade.Unit.X-SwitchMethod == "keep-old";
-            assert home.config.systemd.user.timers.nixheal-upgrade.Timer.OnCalendar == "04:40";
-            assert builtins.elem home.config.programs.nixheal.package home.config.home.packages;
-            assert home.config.programs.nixheal.packageSets.extra ? hello;
-            assert homeInNixos.config.programs.nixheal.name == "laptop";
-            assert homeInNixos.config.programs.nixheal.input == "nixos";
-            assert homeInNixos.config.programs.nixheal.packageSets ? nixos;
+            assert home.config.systemd.user.timers.eppur-upgrade.Timer.OnCalendar == "04:40";
+            assert builtins.elem home.config.programs.eppur.package home.config.home.packages;
+            assert home.config.programs.eppur.packageSets.extra ? hello;
+            assert homeInNixos.config.programs.eppur.name == "laptop";
+            assert homeInNixos.config.programs.eppur.input == "nixos";
+            assert homeInNixos.config.programs.eppur.packageSets ? nixos;
             assert builtins.any (a: nixpkgs.lib.hasInfix "argName = \"pkgs\" would shadow" a.message) (
               failedAssertions shadowing.config
             );
-            pkgs.runCommand "nixheal-home-module-check" { } "touch $out";
+            pkgs.runCommand "eppur-home-module-check" { } "touch $out";
         }
       );
     };

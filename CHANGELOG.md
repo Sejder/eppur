@@ -2,13 +2,22 @@
 
 ## Unreleased
 
+Renamed from nixheal to eppur, after "Eppur si muove" ("and yet it moves"):
+
+- The binary, flake repository (`github:Sejder/eppur`), `programs.eppur` options,
+  `/etc/eppur.json`, `~/.config/eppur.json`, `$EPPUR_CONFIG` and the
+  `eppur-upgrade` units all change. Setting `programs.nixheal` is an error that
+  says so. `pins.json` is unchanged.
+- The state directory and the roots in a `--gc-roots` directory are taken over on
+  the first run, so last good locks and the root of a held host are kept.
+
 Less output:
 
-- nixheal no longer advertises flags, options and commands while it runs, or
+- eppur no longer advertises flags, options and commands while it runs, or
   describes what a later run will do: that is in `--help` and the README. `status`
   and `why` lose their footers of follow-up commands. An error that stops the run
   still says how to get past it.
-- `-v` now also shows nixheal's reasoning, which is no longer shown by default:
+- `-v` now also shows eppur's reasoning, which is no longer shown by default:
   each target that built, why a package set was not pinned, what a merge took,
   and where roots went. `-q` is unchanged.
 - Hold reasons in `pins.json` are shorter, without the advice they ended in.
@@ -30,10 +39,10 @@ Faster runs:
 Fixes:
 
 - `--timeout` could be overrun by a whole build: when it passed during some of
-  nixheal's nix commands, nothing was stopped, and the next build ran to its end.
+  eppur's nix commands, nothing was stopped, and the next build ran to its end.
   Every nix command now stops at the deadline, and nothing new starts after it. A
   SIGTERM now stops all of them too.
-- A locked input containing `''` or `${` no longer stops nixheal from evaluating it.
+- A locked input containing `''` or `${` no longer stops eppur from evaluating it.
 
 ## 0.1.5
 

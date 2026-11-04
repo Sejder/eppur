@@ -203,6 +203,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "eppur"
+version = "0.1.5"
+dependencies = [
+ "anyhow",
+ "clap",
+ "ctrlc",
+ "libc",
+ "regex",
+ "serde",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "errno"
 version = "0.3.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -268,20 +282,6 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
-]
-
-[[package]]
-name = "nixheal"
-version = "0.1.5"
-dependencies = [
- "anyhow",
- "clap",
- "ctrlc",
- "libc",
- "regex",
- "serde",
- "serde_json",
- "sha2",
 ]
 
 [[package]]

@@ -46,8 +46,8 @@ fn default_system() -> String {
 
 #[derive(clap::Args)]
 pub struct Where {
-    /// The config file; by default $NIXHEAL_CONFIG, then
-    /// ~/.config/nixheal.json, then /etc/nixheal.json.
+    /// The config file; by default $EPPUR_CONFIG, then
+    /// ~/.config/eppur.json, then /etc/eppur.json.
     #[arg(
         long,
         global = true,
@@ -77,10 +77,10 @@ pub struct BuildArgs {
     #[arg(long)]
     pub dry_run: bool,
     /// Commit flake.lock and pins.json afterwards (default:
-    /// programs.nixheal.commit, which is off).
+    /// programs.eppur.commit, which is off).
     #[arg(long, overrides_with = "no_commit")]
     pub commit: bool,
-    /// Don't commit, overriding programs.nixheal.commit.
+    /// Don't commit, overriding programs.eppur.commit.
     #[arg(long, overrides_with = "commit")]
     pub no_commit: bool,
 
@@ -165,7 +165,7 @@ struct Ctx {
 
 impl Ctx {
     /// The config and flake a command acts on. A config named by --config or
-    /// $NIXHEAL_CONFIG must load; one found by itself is skipped with a
+    /// $EPPUR_CONFIG must load; one found by itself is skipped with a
     /// warning when the command can do without.
     fn open(at: &Where, need_config: bool) -> Result<Self> {
         let (config, config_path) = match config::locate(at.config.as_deref()) {
@@ -190,7 +190,7 @@ impl Ctx {
             (None, Some(f)) => (
                 PathBuf::from(f),
                 format!(
-                    "programs.nixheal.flake in {}",
+                    "programs.eppur.flake in {}",
                     config_path.as_deref().unwrap_or(Path::new("?")).display()
                 ),
             ),
@@ -223,7 +223,7 @@ impl Ctx {
     }
 
     /// Which flake and config a command acts on, said first, since both can
-    /// come from far away (/etc/nixheal.json from any directory).
+    /// come from far away (/etc/eppur.json from any directory).
     fn announce(&self) {
         match &self.config_path {
             Some(c) => log::info(&format!(
@@ -358,7 +358,7 @@ fn activate(
         (Activation::Switch, _) => "switch",
         (Activation::Boot, Kind::Nixos) => "boot",
         (Activation::Boot, Kind::Home) => {
-            bail!("Home Manager has no boot activation; use nixheal switch")
+            bail!("Home Manager has no boot activation; use eppur switch")
         }
     };
     let installable = format!("{}#{}", flake.display(), target.name);
@@ -417,9 +417,41 @@ fn roots_manifest(dir: &Path, flake: &Path) -> PathBuf {
     ))
 }
 
+/// Roots made when eppur was called nixheal take the new names, rooted again
+/// since nix tracks a root by its path. A held host has no other root.
+fn adopt_old_roots(dir: &Path, flake: &Path) -> Result<()> {
+    let old_manifest = dir.join(format!(
+        ".nixheal-roots-{}",
+        state::key(&flake.to_string_lossy())
+    ));
+    let Ok(text) = std::fs::read_to_string(&old_manifest) else {
+        return Ok(());
+    };
+    let mut names = Vec::new();
+    for old_name in text.lines() {
+        let Some(rest) = old_name.strip_prefix("nixheal-") else {
+            continue;
+        };
+        let name = format!("{ROOT_PREFIX}{rest}");
+        let old = dir.join(old_name);
+        if let Ok(path) = std::fs::read_link(&old) {
+            if path.exists() {
+                nix::add_path_root(&path, &dir.join(&name))?;
+            }
+            std::fs::remove_file(&old).with_context(|| format!("removing {}", old.display()))?;
+        }
+        names.push(name);
+    }
+    let mut text = names.join("\n");
+    text.push('\n');
+    crate::pins::write_atomic(&roots_manifest(dir, flake), text.as_bytes())?;
+    std::fs::remove_file(&old_manifest)
+        .with_context(|| format!("removing {}", old_manifest.display()))
+}
+
 /// Root the systems that built, and remove the roots this flake's runs made
 /// for targets that are no longer configured (only when `prune`), so their
-/// systems can be collected. Roots nixheal did not make are left alone.
+/// systems can be collected. Roots eppur did not make are left alone.
 fn update_roots(
     dir: &Path,
     flake: &Path,
@@ -428,6 +460,7 @@ fn update_roots(
     prune: bool,
 ) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    adopt_old_roots(dir, flake)?;
     let manifest = roots_manifest(dir, flake);
     // Roots are named by target only, so two flakes rooting a target of the
     // same name in one directory would overwrite and prune each other's.
@@ -507,7 +540,7 @@ fn check_flake(ctx: &Ctx) -> Result<()> {
     let flake = ctx.flake.as_path();
     if !flake.join("flake.lock").is_file() {
         bail!(
-            "no flake.lock in {} ({}); nixheal needs a locked flake: {}run nix flake lock there",
+            "no flake.lock in {} ({}); eppur needs a locked flake: {}run nix flake lock there",
             flake.display(),
             ctx.source,
             if ctx.source == "from --flake" {
@@ -526,7 +559,7 @@ fn check_flake(ctx: &Ctx) -> Result<()> {
     }
     if flake.starts_with("/nix/store") {
         bail!(
-            "{} is in the nix store; point programs.nixheal.flake (or --flake) at your checkout",
+            "{} is in the nix store; point programs.eppur.flake (or --flake) at your checkout",
             flake.display()
         );
     }
@@ -535,7 +568,7 @@ fn check_flake(ctx: &Ctx) -> Result<()> {
         .uid();
     if is_root() && owner != 0 {
         bail!(
-            "{} belongs to uid {owner}; run nixheal as that user, or as root it would leave root-owned files and git objects there (for the timer, set programs.nixheal.autoUpgrade.user)",
+            "{} belongs to uid {owner}; run eppur as that user, or as root it would leave root-owned files and git objects there (for the timer, set programs.eppur.autoUpgrade.user)",
             flake.display()
         );
     }
@@ -697,11 +730,11 @@ pub fn reconcile(at: &Where, args: &BuildArgs, how: Activation) -> Result<ExitCo
         targets.retain(|t| args.only.iter().any(|n| wanted(t, n)));
     }
     if targets.is_empty() {
-        bail!("no hosts or homes to build: set programs.nixheal.hosts or homes");
+        bail!("no hosts or homes to build: set programs.eppur.hosts or homes");
     }
     let local = Some(cfg.local()).filter(|l| targets.contains(l));
     if how == Activation::Boot && local.as_ref().is_some_and(|l| l.kind == Kind::Home) {
-        bail!("Home Manager has no boot activation; use nixheal switch");
+        bail!("Home Manager has no boot activation; use eppur switch");
     }
     // The machine's own host is given up on, not held, unless it builds a
     // fleet: holding it would leave it running an old system unnoticed.
@@ -894,9 +927,9 @@ pub fn reconcile(at: &Where, args: &BuildArgs, how: Activation) -> Result<ExitCo
             }
             {
                 let title = if git.changed(&[&lock_path])? {
-                    "nixheal: update flake.lock"
+                    "eppur: update flake.lock"
                 } else {
-                    "nixheal: update pins"
+                    "eppur: update pins"
                 };
                 let mut message = title.to_string();
                 if !report.changes.is_empty() {
@@ -1024,10 +1057,7 @@ pub fn merge(at: &Where, other: &Path) -> Result<ExitCode> {
         );
     }
     if raw.get("version").is_none() {
-        bail!(
-            "{} is not a nixheal pins file (no version)",
-            other.display()
-        );
+        bail!("{} is not an eppur pins file (no version)", other.display());
     }
     let incoming =
         PinsFile::parse(&bytes).with_context(|| format!("parsing {}", other.display()))?;
@@ -1356,11 +1386,11 @@ pub fn pin(
         Some(i) => (i.to_string(), "--input"),
         None => (
             Nix::new(&ctx.flake)
-                .eval_raw(&format!("{}.input", target.nixheal_config()))
+                .eval_raw(&format!("{}.input", target.eppur_config()))
                 .ok()
                 .or_else(|| ctx.config.as_ref().and_then(|c| c.input.clone()))
                 .unwrap_or_else(|| "nixpkgs".to_string()),
-            "programs.nixheal.input",
+            "programs.eppur.input",
         ),
     };
     let input = input.as_str();
@@ -1374,7 +1404,7 @@ pub fn pin(
             if from == "--input" {
                 ""
             } else {
-                "; pass --input or set programs.nixheal.input"
+                "; pass --input or set programs.eppur.input"
             }
         );
     };
@@ -1486,7 +1516,7 @@ pub fn retry(at: &Where, pick: &Pick, attr: &str, input: Option<&str>) -> Result
         .collect();
     if !manual.is_empty() {
         bail!(
-            "{attr} ({}) on {target} is pinned by hand and never retried; remove it with 'nixheal clear {attr}{}'",
+            "{attr} ({}) on {target} is pinned by hand and never retried; remove it with 'eppur clear {attr}{}'",
             manual
                 .iter()
                 .map(|s| s.as_str())

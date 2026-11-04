@@ -37,7 +37,7 @@ pub fn age_text(days: Option<i64>) -> String {
     }
 }
 
-/// What made nixheal pin it, e.g. "cloudflared-2026.10.3 failed to build".
+/// What made eppur pin it, e.g. "cloudflared-2026.10.3 failed to build".
 pub fn cause(pin: &Pin) -> String {
     match pin.reason {
         Reason::Build => match &pin.failed_drv {
@@ -49,7 +49,7 @@ pub fn cause(pin: &Pin) -> String {
     }
 }
 
-/// What made nixheal pin a flake input.
+/// What made eppur pin a flake input.
 pub fn input_cause(pin: &InputPin) -> String {
     match (&pin.failed_drv, &pin.error) {
         (Some(drv), _) => format!("{} failed to build", drv_name(drv)),

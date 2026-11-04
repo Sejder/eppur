@@ -16,7 +16,7 @@ use serde_json::Value;
 use std::collections::BTreeSet;
 use std::path::Path;
 
-/// An input to take back to `locked`, and what made nixheal do it.
+/// An input to take back to `locked`, and what made eppur do it.
 #[derive(Debug, Clone)]
 pub struct Rollback {
     pub input: String,

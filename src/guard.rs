@@ -59,7 +59,7 @@ static HANDLER: Once = Once::new();
 static CHILDREN: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
 /// Remember a running nix, so an interrupt stops it too: a SIGTERM sent to
-/// nixheal alone (kill, timeout) does not reach it otherwise.
+/// eppur alone (kill, timeout) does not reach it otherwise.
 pub fn track(pid: u32) {
     if let Ok(mut c) = CHILDREN.lock() {
         c.push(pid);
@@ -239,7 +239,7 @@ pub struct RunLock {
 
 pub fn lock_flake(flake: &Path) -> Result<RunLock> {
     let path = match Git::open(flake).and_then(|g| g.git_dir()) {
-        Some(dir) => dir.join("nixheal.lock"),
+        Some(dir) => dir.join("eppur.lock"),
         None => crate::state::lock_path(flake)?,
     };
     let file = std::fs::OpenOptions::new()
@@ -252,7 +252,7 @@ pub fn lock_flake(flake: &Path) -> Result<RunLock> {
         Ok(()) => Ok(RunLock { _file: file }),
         Err(std::fs::TryLockError::WouldBlock) => {
             bail!(
-                "another nixheal run is using {}; try again when it is done",
+                "another eppur run is using {}; try again when it is done",
                 flake.display()
             )
         }

@@ -18,22 +18,22 @@ mod summary;
 use clap::{Parser, Subcommand};
 use std::process::ExitCode;
 
-const BUILD_EXIT: &str = "Exit status: 0 when everything built or was held, 1 when nixheal gave up on this machine's own host, 2 on errors, 3 with --fail-on-hold when something is held, 130 when interrupted.";
-const SWITCH_EXIT: &str = "Exit status: 0 when everything built or was held and the switch worked, 1 when nixheal gave up on this machine's own host, 2 on errors, 3 with --fail-on-hold when something is held, 4 when the switcher failed (the build and the files are kept), 130 when interrupted.";
+const BUILD_EXIT: &str = "Exit status: 0 when everything built or was held, 1 when eppur gave up on this machine's own host, 2 on errors, 3 with --fail-on-hold when something is held, 130 when interrupted.";
+const SWITCH_EXIT: &str = "Exit status: 0 when everything built or was held and the switch worked, 1 when eppur gave up on this machine's own host, 2 on errors, 3 with --fail-on-hold when something is held, 4 when the switcher failed (the build and the files are kept), 130 when interrupted.";
 
 /// Update a flake and keep it building: packages that fail are pinned to the
 /// nixpkgs they last built with, and unpinned once they build again.
 #[derive(Parser)]
 #[command(
     version,
-    after_help = "Start with 'nixheal switch --update'. See what is pinned with 'nixheal status', \
-                  why with 'nixheal why ATTR', and undo a pin with 'nixheal clear ATTR'."
+    after_help = "Start with 'eppur switch --update'. See what is pinned with 'eppur status', \
+                  why with 'eppur why ATTR', and undo a pin with 'eppur clear ATTR'."
 )]
 struct Cli {
     /// Only report pins, unpins, holds, warnings and errors.
     #[arg(short, long, global = true, help_heading = "Global options")]
     quiet: bool,
-    /// Show progress and nixheal's reasoning, overriding programs.nixheal.quiet.
+    /// Show progress and eppur's reasoning, overriding programs.eppur.quiet.
     #[arg(
         short,
         long,
@@ -94,7 +94,7 @@ enum Command {
         /// A top-level package attribute, e.g. firefox.
         #[arg(value_name = "ATTR")]
         attr: String,
-        /// The input to pin it in; defaults to programs.nixheal.input.
+        /// The input to pin it in; defaults to programs.eppur.input.
         #[arg(long, value_name = "INPUT")]
         input: Option<String>,
         /// Pin it at the input's revision in this flake.lock instead of the
@@ -103,7 +103,7 @@ enum Command {
         #[arg(long, value_name = "FILE")]
         old_lock: Option<std::path::PathBuf>,
     },
-    /// Have the next run retry a pin nixheal made, without waiting for its
+    /// Have the next run retry a pin eppur made, without waiting for its
     /// package set to move: the pin goes if the package builds, and stays at
     /// its revision if it still fails.
     Retry {
@@ -189,9 +189,9 @@ fn main() -> ExitCode {
     };
     result.unwrap_or_else(|e| {
         log::flush_nix_errors();
-        eprintln!("nixheal: error: {e:#}");
+        eprintln!("eppur: error: {e:#}");
         if let Err(e) = guard::restore() {
-            eprintln!("nixheal: error: restoring flake.lock and pins.json failed: {e:#}");
+            eprintln!("eppur: error: restoring flake.lock and pins.json failed: {e:#}");
         }
         ExitCode::from(2)
     })

@@ -7,7 +7,7 @@ self:
   ...
 }:
 let
-  cfg = config.programs.nixheal;
+  cfg = config.programs.eppur;
   nhFlake = config.programs.nh.flake or null;
 
   marked = import ./marked.nix;
@@ -33,7 +33,7 @@ let
     )
   ) cfg.nixpkgs;
 
-  runsNixheal = cfg.hosts != [ ] || cfg.homes != [ ];
+  runsEppur = cfg.hosts != [ ] || cfg.homes != [ ];
   reservedArgs = [
     "pkgs"
     "lib"
@@ -46,10 +46,10 @@ let
   up = cfg.autoUpgrade;
   readOnlyPkgs = !(options.nixpkgs ? localSystem);
   upCommit = if up.commit == null then cfg.commit else up.commit;
-  builtLink = "/run/nixheal/system";
-  activateScript = pkgs.writeShellScript "nixheal-activate" ''
+  builtLink = "/run/eppur/system";
+  activateScript = pkgs.writeShellScript "eppur-activate" ''
     set -eu
-    link="''${NIXHEAL_BUILT_LINK:-${builtLink}}"
+    link="''${EPPUR_BUILT_LINK:-${builtLink}}"
     [ -L "$link" ] || exit 0
     system="$(${pkgs.coreutils}/bin/readlink -f "$link")"
     case "$system" in
@@ -69,7 +69,11 @@ let
   '';
 in
 {
-  options.programs.nixheal =
+  imports = [
+    (lib.mkRemovedOptionModule [ "programs" "nixheal" ] "nixheal was renamed: use the eppur flake (github:Sejder/eppur) and programs.eppur.")
+  ];
+
+  options.programs.eppur =
     lib.recursiveUpdate
       (import ./options.nix {
         inherit lib self pkgs;
@@ -103,12 +107,12 @@ in
       assertions = [
         {
           assertion = false;
-          message = "programs.nixheal.autoUpgrade needs programs.nixheal.enable";
+          message = "programs.eppur.autoUpgrade needs programs.eppur.enable";
         }
       ];
     })
     {
-      programs.nixheal.importPinned =
+      programs.eppur.importPinned =
         { locked, overlays }:
         import ./import-pinned.nix {
           config = if options.nixpkgs.pkgs.isDefined then pkgs.config else config.nixpkgs.config;
@@ -118,7 +122,7 @@ in
           inherit locked;
           overlays = if overlays then marked.before (pkgs.overlays or [ ]) else [ ];
         };
-      programs.nixheal.packageSets = {
+      programs.eppur.packageSets = {
         ${cfg.input} = pkgs;
       }
       // extraSets;
@@ -133,23 +137,23 @@ in
         assertions = [
           {
             assertion = cfg.pinsFile != null;
-            message = "programs.nixheal.pinsFile must point at the flake's pins.json";
+            message = "programs.eppur.pinsFile must point at the flake's pins.json";
           }
           {
             assertion =
               cfg.pinsFile == null
               || builtins.isPath cfg.pinsFile
               || lib.hasPrefix "${builtins.storeDir}/" (toString cfg.pinsFile);
-            message = "programs.nixheal.pinsFile must be a path such as ./pins.json, not a string";
+            message = "programs.eppur.pinsFile must be a path such as ./pins.json, not a string";
           }
         ]
         ++ lib.mapAttrsToList (input: set: {
           assertion = set.argName == null || !(builtins.elem set.argName reservedArgs);
-          message = "programs.nixheal.nixpkgs.${input}.argName = \"${toString set.argName}\" would shadow a module argument";
+          message = "programs.eppur.nixpkgs.${input}.argName = \"${toString set.argName}\" would shadow a module argument";
         }) cfg.nixpkgs;
         warnings =
           lib.optional (readOnlyPkgs)
-            "programs.nixheal cannot add its overlay to a read-only nixpkgs (nixosModules.readOnlyPkgs); add nixheal.lib.mkOverlay to the pkgs you pass in, or its pins do not apply";
+            "programs.eppur cannot add its overlay to a read-only nixpkgs (nixosModules.readOnlyPkgs); add eppur.lib.mkOverlay to the pkgs you pass in, or its pins do not apply";
       }
       // lib.optionalAttrs (!readOnlyPkgs) {
         nixpkgs.overlays = lib.mkAfter [
@@ -157,12 +161,12 @@ in
         ];
       }
     ))
-    (lib.mkIf (cfg.enable && runsNixheal) {
+    (lib.mkIf (cfg.enable && runsEppur) {
       environment.systemPackages = [
         cfg.package
       ]
       ++ lib.optional (cfg.switcher == "nh" && !(config.programs.nh.enable or false)) pkgs.nh;
-      environment.etc."nixheal.json".text = builtins.toJSON {
+      environment.etc."eppur.json".text = builtins.toJSON {
         kind = "nixos";
         self = cfg.name;
         inherit (cfg)
@@ -186,21 +190,21 @@ in
       assertions = [
         {
           assertion = builtins.elem cfg.name cfg.hosts;
-          message = "programs.nixheal.autoUpgrade needs this host (${cfg.name}) in programs.nixheal.hosts";
+          message = "programs.eppur.autoUpgrade needs this host (${cfg.name}) in programs.eppur.hosts";
         }
         {
           assertion = cfg.flake != null;
-          message = "programs.nixheal.autoUpgrade needs programs.nixheal.flake";
+          message = "programs.eppur.autoUpgrade needs programs.eppur.flake";
         }
         {
           assertion = up.user != null;
-          message = "programs.nixheal.autoUpgrade.user must be set to the owner of ${toString cfg.flake}";
+          message = "programs.eppur.autoUpgrade.user must be set to the owner of ${toString cfg.flake}";
         }
       ];
-      warnings = lib.optional config.system.autoUpgrade.enable "programs.nixheal.autoUpgrade and system.autoUpgrade both update this host; disable one";
+      warnings = lib.optional config.system.autoUpgrade.enable "programs.eppur.autoUpgrade and system.autoUpgrade both update this host; disable one";
 
-      systemd.services.nixheal-upgrade = {
-        description = "Update the flake with nixheal and activate the result";
+      systemd.services.eppur-upgrade = {
+        description = "Update the flake with eppur and activate the result";
         wants = [ "network-online.target" ];
         after = [ "network-online.target" ];
         restartIfChanged = false;
@@ -213,13 +217,13 @@ in
           config.programs.ssh.package
         ];
         environment = {
-          NIXHEAL_CONFIG = "/etc/nixheal.json";
+          EPPUR_CONFIG = "/etc/eppur.json";
         }
         // lib.optionalAttrs (up.user == "root") {
-          GIT_AUTHOR_NAME = "nixheal";
-          GIT_AUTHOR_EMAIL = "nixheal@${config.networking.hostName}";
-          GIT_COMMITTER_NAME = "nixheal";
-          GIT_COMMITTER_EMAIL = "nixheal@${config.networking.hostName}";
+          GIT_AUTHOR_NAME = "eppur";
+          GIT_AUTHOR_EMAIL = "eppur@${config.networking.hostName}";
+          GIT_COMMITTER_NAME = "eppur";
+          GIT_COMMITTER_EMAIL = "eppur@${config.networking.hostName}";
         };
         unitConfig = {
           OnFailure = up.onFailure;
@@ -228,7 +232,7 @@ in
         serviceConfig = {
           Type = "oneshot";
           User = up.user;
-          RuntimeDirectory = "nixheal";
+          RuntimeDirectory = "eppur";
           ExecStart = lib.escapeShellArgs (
             [
               (lib.getExe cfg.package)
@@ -248,8 +252,8 @@ in
         };
       };
 
-      systemd.timers.nixheal-upgrade = {
-        description = "Scheduled nixheal upgrade";
+      systemd.timers.eppur-upgrade = {
+        description = "Scheduled eppur upgrade";
         wantedBy = [ "timers.target" ];
         timerConfig = {
           OnCalendar = up.dates;
