@@ -20,14 +20,12 @@ $ nixheal switch --update
 nixheal: flake /home/alice/nixos (config /etc/nixheal.json)
 nixheal: round 1: evaluating and building host laptop
 nixheal: pinned host laptop: sbctl (nixpkgs) at 718f670e8453 from 2026-10-20: sbctl-0.18 failed to build
-nixheal: the errors above were handled: pinned 1 package, building again
 nixheal: round 2: evaluating and building host laptop with 1 pinned package
-nixheal: host laptop builds
-nixheal: done: 1 built, 1 pinned; flake.lock and pins.json have uncommitted changes (commit them, pass --commit, or set programs.nixheal.commit = true)
+nixheal: done: 1 built, 1 pinned; flake.lock and pins.json uncommitted
 nixheal: switching host laptop with nh
 ...
 $ nixheal switch --update          # a few days later, sbctl is fixed upstream
-nixheal: retrying host laptop: sbctl (nixpkgs): nixpkgs moved since it was pinned
+nixheal: retrying host laptop: sbctl (nixpkgs)
 nixheal: unpinned host laptop: sbctl (nixpkgs): builds again
 ```
 
@@ -269,7 +267,9 @@ entry). `pin`, `clear` and `merge` only change `pins.json`; the next `build`,
 `--config FILE`, `--flake DIR`, `-q` and `-v` work before or after the
 command. `-q` (`--quiet`) prints only pins, unpins, holds, warnings, errors and
 files left uncommitted; nix's own messages are shown only when nixheal could
-not handle them. `-v` (`--verbose`) overrides `programs.nixheal.quiet`.
+not handle them. `-v` (`--verbose`) overrides `programs.nixheal.quiet`, and
+adds nixheal's reasoning: each target that built, why a package set was not
+pinned, what a merge took. Up to four evaluations run at once.
 Every command but `status` and `why` says first which flake and config it
 acts on, since by default both come from `/etc/nixheal.json` or
 `~/.config/nixheal.json`, wherever you run it. A `--config` (or
@@ -469,12 +469,8 @@ flake /home/alice/nixos
 TARGET       PACKAGE (SETS)                          REASON           SINCE
 host laptop  open-webui (nixpkgs, nixpkgs-unstable)  evaluation failed  2026-10-20 (8d)  0.6.30 at 718f670e8453
 host server  -                                       whole host held  2026-10-01 (27d) STALE
-    nixpkgs.linux fails and is on the never-pin list (...)
+    nixpkgs.linux fails and is on the never-pin list
 1 pinned package, 1 held, 1 stale (older than 14 days).
-  nixheal why ATTR       explains a pin
-  nixheal retry ATTR     retries one now, keeping it if the package still fails
-  nixheal clear ATTR     removes one
-  nixheal clear --held   releases a hold (with --host or --home NAME)
 ```
 
 ## Limitations

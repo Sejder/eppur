@@ -28,6 +28,15 @@ pub fn name_version(name: &str) -> &str {
     name[strip_version(name).len()..].trim_start_matches('-')
 }
 
+/// How old something is, as status and the dashboards show it.
+pub fn age_text(days: Option<i64>) -> String {
+    match days {
+        Some(0) => "today".into(),
+        Some(d) => format!("{d}d"),
+        None => "?".into(),
+    }
+}
+
 /// What made nixheal pin it, e.g. "cloudflared-2026.10.3 failed to build".
 pub fn cause(pin: &Pin) -> String {
     match pin.reason {
@@ -197,11 +206,7 @@ pub fn summary(
     } else {
         "OK"
     };
-    let age = |i: &Item| match i.days {
-        Some(0) => "today".to_string(),
-        Some(d) => format!("{d}d"),
-        None => "?".to_string(),
-    };
+    let age = |i: &Item| age_text(i.days);
     let oldest = items.first();
     let list = if items.is_empty() {
         "nothing pinned".to_string()

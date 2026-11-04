@@ -33,7 +33,7 @@ struct Cli {
     /// Only report pins, unpins, holds, warnings and errors.
     #[arg(short, long, global = true, help_heading = "Global options")]
     quiet: bool,
-    /// Show progress, overriding programs.nixheal.quiet.
+    /// Show progress and nixheal's reasoning, overriding programs.nixheal.quiet.
     #[arg(
         short,
         long,

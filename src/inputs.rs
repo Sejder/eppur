@@ -5,7 +5,7 @@
 //! the whole flake, and moves on again once its new revision builds.
 
 use crate::date;
-use crate::engine::describe;
+use crate::engine::{Change, describe};
 use crate::lock::Lock;
 use crate::log;
 use crate::nix::Nix;
@@ -135,9 +135,7 @@ pub fn settle(nix: &Nix, lock_path: &Path, pins_path: &Path, deny: &[String]) ->
             }
             Step::Retry => {
                 pin.retrying = true;
-                log::info(&format!(
-                    "retrying input {name}: it moved since it was pinned"
-                ));
+                log::info(&format!("retrying input {name}"));
             }
         }
     }
@@ -149,7 +147,7 @@ pub fn settle(nix: &Nix, lock_path: &Path, pins_path: &Path, deny: &[String]) ->
                 return Err(e);
             }
             log::warn(&format!(
-                "cannot put input {name} back ({e:#}); trying its current revision. 'nixheal clear --flake-input {name}' removes the pin"
+                "cannot put input {name} back ({e:#}); trying its current revision"
             ));
             if let Some(pin) = file.inputs.get_mut(&name) {
                 pin.retrying = true;
@@ -171,7 +169,7 @@ pub fn apply(
     pins_path: &Path,
     rollbacks: &[Rollback],
     today: i64,
-) -> Result<Vec<String>> {
+) -> Result<Vec<Change>> {
     let wanted: Vec<(String, Value)> = rollbacks
         .iter()
         .map(|r| (r.input.clone(), r.locked.clone()))
@@ -206,11 +204,11 @@ pub fn apply(
             crate::summary::input_cause(&pin),
             r.targets.join(", ")
         ));
-        changes.push(format!(
-            "pinned input {}: {}",
+        changes.push(Change::Pinned(format!(
+            "input {}: {}",
             r.input,
             crate::summary::input_cause(&pin)
-        ));
+        )));
         file.inputs.insert(r.input.clone(), pin);
     }
     file.touch_inputs();

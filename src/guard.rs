@@ -103,6 +103,10 @@ fn stop_children() {
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
+pub fn interrupted() -> bool {
+    INTERRUPTED.load(Ordering::SeqCst)
+}
+
 /// After a nix command returned: if the run is being interrupted, wait for
 /// the signal handler, which restores the files and exits.
 pub fn halt_if_interrupted() {
@@ -132,6 +136,12 @@ pub fn deadline(limit: Duration) {
 /// The build part of the run is over; a deadline no longer applies.
 pub fn built() {
     BUILDING.store(false, Ordering::SeqCst);
+}
+
+/// Whether nix commands must stop: --timeout passed while the run still
+/// builds. Rooting and activating afterwards are not cut short.
+pub fn past_deadline() -> bool {
+    TIMED_OUT.load(Ordering::SeqCst) && BUILDING.load(Ordering::SeqCst)
 }
 
 pub fn timed_out() -> bool {

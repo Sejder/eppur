@@ -27,10 +27,6 @@ pub fn set_dry_run(dry: bool) {
     DRY_RUN.store(dry, Ordering::Relaxed);
 }
 
-pub fn is_dry_run() -> bool {
-    DRY_RUN.load(Ordering::Relaxed)
-}
-
 /// Whether stderr is the journal: systemd sets JOURNAL_STREAM to the
 /// device and inode of the stream it connected, which a terminal or a pipe a
 /// child of the service opened does not match.
@@ -54,6 +50,13 @@ fn journal() -> bool {
 /// Progress; hidden with --quiet.
 pub fn info(msg: &str) {
     if !is_quiet() {
+        eprintln!("nixheal: {msg}");
+    }
+}
+
+/// Reasoning that only matters when debugging; shown only with --verbose.
+pub fn detail(msg: &str) {
+    if VERBOSE.load(Ordering::Relaxed) {
         eprintln!("nixheal: {msg}");
     }
 }

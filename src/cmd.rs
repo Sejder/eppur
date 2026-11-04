@@ -1,6 +1,6 @@
 use crate::config::{self, Config, ROOT_PREFIX, Target};
 use crate::date;
-use crate::engine::{self, Engine};
+use crate::engine::{self, Change, Engine};
 use crate::git::Git;
 use crate::guard;
 use crate::inputs;
@@ -334,24 +334,14 @@ fn ensure_pins(path: &Path, git: Option<&Git>, quietly: bool) -> Result<(bool, b
     {
         git.intent_to_add(path)?;
         added = true;
-        say(format!(
-            "added {} to the git index so the flake can see it",
-            path.display()
-        ));
+        say(format!("added {} to the git index", path.display()));
     }
     Ok((created, added))
 }
 
 fn is_root() -> bool {
-    std::fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("Uid:"))
-                .map(str::to_string)
-        })
-        .and_then(|l| l.split_whitespace().nth(1).map(|u| u == "0"))
-        .unwrap_or(false)
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    unsafe { libc::geteuid() == 0 }
 }
 
 /// Activate the built system. With nh it is handed the store path, so it only
@@ -413,7 +403,7 @@ fn activate(
         return Ok(ExitCode::SUCCESS);
     }
     log::warn(&format!(
-        "{program} failed ({status}); {target} built, and flake.lock and pins.json are kept, so run 'nixheal {verb}' again once that is fixed"
+        "{program} failed ({status}); {target} built, flake.lock and pins.json kept"
     ));
     Ok(ExitCode::from(4))
 }
@@ -552,22 +542,39 @@ fn check_flake(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-/// The counts of a run's changes, as the closing line reports them.
-fn tally(changes: &[String]) -> String {
-    let count = |prefix: &str| changes.iter().filter(|c| c.starts_with(prefix)).count();
-    let mut parts = Vec::new();
-    for (prefix, word) in [
-        ("pinned ", "pinned"),
-        ("unpinned ", "unpinned"),
-        ("held ", "held"),
-        ("released ", "released"),
-        ("moved pin ", "moved to a donor"),
-    ] {
-        let n = count(prefix);
-        if n > 0 {
-            parts.push(format!("{n} {word}"));
+/// What became of flake.lock and pins.json, for the closing line.
+enum Closing {
+    NoRepository { commit: bool },
+    Unchanged,
+    Uncommitted,
+    Committed(String),
+}
+
+impl std::fmt::Display for Closing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Closing::NoRepository { commit: true } => {
+                f.write_str("the flake is not in a git repository, so nothing was committed")
+            }
+            Closing::NoRepository { commit: false } => {
+                f.write_str("flake.lock and pins.json are not in a git repository")
+            }
+            Closing::Unchanged => f.write_str("flake.lock and pins.json unchanged"),
+            Closing::Uncommitted => f.write_str("flake.lock and pins.json uncommitted"),
+            Closing::Committed(what) => write!(f, "committed {what}"),
         }
     }
+}
+
+/// The counts of a run's changes, as the closing line reports them.
+fn tally(changes: &[Change]) -> String {
+    let parts: Vec<String> = ["pinned", "unpinned", "held", "released", "moved to a donor"]
+        .into_iter()
+        .filter_map(|word| {
+            let n = changes.iter().filter(|c| c.word() == word).count();
+            (n > 0).then(|| format!("{n} {word}"))
+        })
+        .collect();
     if parts.is_empty() {
         "nothing pinned or unpinned in this run".into()
     } else {
@@ -594,7 +601,7 @@ fn run_rolling_back(
     let mut may_roll_back = allowed;
     let mut tried: BTreeSet<(String, String)> = BTreeSet::new();
     let mut must_build: BTreeSet<String> = BTreeSet::new();
-    let mut changes: Vec<String> = Vec::new();
+    let mut changes: Vec<Change> = Vec::new();
     loop {
         let engine = engine_with(may_roll_back)?;
         let pins_now = std::fs::read(pins_path)?;
@@ -778,7 +785,14 @@ pub fn reconcile(at: &Where, args: &BuildArgs, how: Activation) -> Result<ExitCo
     }
     inputs::settle(&nix, &lock_path, &pins_path, &cfg.input_deny)?;
 
-    let flake_targets = nix.flake_targets();
+    let host_names = nix.output_names("nixosConfigurations");
+    let home_names = nix.output_names("homeConfigurations");
+    let flake_targets = host_names.as_ref().zip(home_names.as_ref()).map(|(h, m)| {
+        h.iter()
+            .map(|n| format!("host {n}"))
+            .chain(m.iter().map(|n| format!("home {n}")))
+            .collect::<Vec<_>>()
+    });
     // flake.lock is the whole flake's. A run may only roll an input back if it
     // speaks for the whole flake: it builds a fleet, or nothing is left out.
     let covers_flake = args.hold_local
@@ -816,9 +830,12 @@ pub fn reconcile(at: &Where, args: &BuildArgs, how: Activation) -> Result<ExitCo
                 .chain([cfg.input.clone().unwrap_or_else(|| "nixpkgs".into())])
                 .collect(),
             flake_targets: flake_targets.clone(),
+            host_names: host_names.clone(),
+            home_names: home_names.clone(),
             may_roll_back,
             retry_same_after_days: cfg.retry_same_derivation_after_days,
             copies: Default::default(),
+            lost: Default::default(),
         })
     };
     log::set_dry_run(args.dry_run);
@@ -834,18 +851,13 @@ pub fn reconcile(at: &Where, args: &BuildArgs, how: Activation) -> Result<ExitCo
 
     if report.local_failure.is_some() {
         guard::restore()?;
-        log::change(
-            "nothing was committed or activated. Fix the failure, or on a machine that builds a fleet, pass --hold-local to hold this host and update the rest",
-        );
+        log::change("nothing committed or activated");
         return Ok(ExitCode::from(1));
     }
 
     if args.dry_run {
         guard::restore_quietly()?;
-        log::change(&format!(
-            "dry run: {}; nothing was written, committed or activated",
-            tally(&report.changes)
-        ));
+        log::change(&format!("dry run: {}", tally(&report.changes)));
         if args.fail_on_hold && report.held > 0 {
             return Ok(ExitCode::from(3));
         }
@@ -854,7 +866,7 @@ pub fn reconcile(at: &Where, args: &BuildArgs, how: Activation) -> Result<ExitCo
 
     // From here the run's results stand or fall together: any error before
     // the commit puts flake.lock and pins.json back.
-    let settled = (|| -> Result<String> {
+    let settled = (|| -> Result<Closing> {
         if let Some(dir) = &args.gc_roots {
             update_roots(
                 dir,
@@ -863,7 +875,7 @@ pub fn reconcile(at: &Where, args: &BuildArgs, how: Activation) -> Result<ExitCo
                 &cfg.targets(),
                 args.only.is_empty(),
             )?;
-            log::info(&format!(
+            log::detail(&format!(
                 "rooted {} in {}",
                 engine::plural(report.built.len(), "system"),
                 dir.display()
@@ -872,20 +884,13 @@ pub fn reconcile(at: &Where, args: &BuildArgs, how: Activation) -> Result<ExitCo
         guard::settle(|| {
             let commit = (cfg.commit || args.commit) && !args.no_commit;
             let Some(git) = &git else {
-                return Ok(if commit {
-                    "the flake is not in a git repository, so nothing was committed".into()
-                } else {
-                    "flake.lock and pins.json are not in a git repository".into()
-                });
+                return Ok(Closing::NoRepository { commit });
             };
             if !git.changed(&[&lock_path, &pins_path])? {
-                return Ok("flake.lock and pins.json unchanged".into());
+                return Ok(Closing::Unchanged);
             }
             if !commit {
-                return Ok(
-                    "flake.lock and pins.json have uncommitted changes (commit them, pass --commit, or set programs.nixheal.commit = true)"
-                        .into(),
-                );
+                return Ok(Closing::Uncommitted);
             }
             {
                 let title = if git.changed(&[&lock_path])? {
@@ -896,27 +901,27 @@ pub fn reconcile(at: &Where, args: &BuildArgs, how: Activation) -> Result<ExitCo
                 let mut message = title.to_string();
                 if !report.changes.is_empty() {
                     message.push_str("\n\n");
-                    message.push_str(&report.changes.join("\n"));
+                    let lines: Vec<String> = report.changes.iter().map(Change::to_string).collect();
+                    message.push_str(&lines.join("\n"));
                 }
                 if git.commit(&[&lock_path, &pins_path], &message)? {
-                    return Ok(match git.head() {
-                        Some(h) => format!("committed {h} {title:?}"),
-                        None => format!("committed {title:?}"),
-                    });
+                    return Ok(Closing::Committed(match git.head() {
+                        Some(h) => format!("{h} {title:?}"),
+                        None => format!("{title:?}"),
+                    }));
                 }
-                Ok("nothing to commit".into())
+                Ok(Closing::Unchanged)
             }
         })
     })();
-    let committed = settled?;
+    let closing = settled?;
     let done = format!(
-        "done: {} built, {}; {}",
+        "done: {} built, {}; {closing}",
         report.built.len(),
-        tally(&report.changes),
-        committed
+        tally(&report.changes)
     );
     // Files left changed are worth a line under --quiet too.
-    if committed.contains("uncommitted") {
+    if matches!(closing, Closing::Uncommitted) {
         log::change(&done);
     } else {
         log::info(&done);
@@ -948,9 +953,7 @@ pub fn reconcile(at: &Where, args: &BuildArgs, how: Activation) -> Result<ExitCo
     let code = match &local {
         Some(target) if report.local_held => {
             if how != Activation::None {
-                log::warn(&format!(
-                    "not activating: {target} is held; see nixheal status"
-                ));
+                log::warn(&format!("not activating: {target} is held"));
             }
             ExitCode::SUCCESS
         }
@@ -965,10 +968,6 @@ pub fn reconcile(at: &Where, args: &BuildArgs, how: Activation) -> Result<ExitCo
         None => ExitCode::SUCCESS,
     };
     if args.fail_on_hold && report.held > 0 && code == ExitCode::SUCCESS {
-        log::warn(&format!(
-            "{} held; exiting with 3 (--fail-on-hold)",
-            engine::plural(report.held, "host or home")
-        ));
         return Ok(ExitCode::from(3));
     }
     Ok(code)
@@ -1046,7 +1045,7 @@ pub fn merge(at: &Where, other: &Path) -> Result<ExitCode> {
         }
         if file.merge_for_lock(kind, name, entry.clone(), lock_sha256.as_deref()) {
             taken += 1;
-            log::info(&format!("took {target} from {}", other.display()));
+            log::detail(&format!("took {target} from {}", other.display()));
         } else {
             log::info(&format!(
                 "kept {target}: the entry here comes from a newer lock"
@@ -1055,23 +1054,18 @@ pub fn merge(at: &Where, other: &Path) -> Result<ExitCode> {
     }
     if file.merge_inputs(&incoming) {
         taken += 1;
-        log::info(&format!(
+        log::detail(&format!(
             "took the flake input pins from {}",
             other.display()
         ));
     }
     file.save(&pins_path)?;
     log::change(&format!(
-        "merged {} entr{} from {} into {}{}",
+        "merged {} entr{} from {} into {}",
         taken,
         if taken == 1 { "y" } else { "ies" },
         other.display(),
-        pins_path.display(),
-        if taken > 0 {
-            "; the next build applies it"
-        } else {
-            ""
-        }
+        pins_path.display()
     ));
     Ok(ExitCode::SUCCESS)
 }
@@ -1081,14 +1075,6 @@ fn reason_words(reason: Reason) -> &'static str {
         Reason::Build => "failed to build",
         Reason::Eval => "failed to evaluate",
         Reason::Manual => "pinned by hand",
-    }
-}
-
-fn age_text(days: Option<i64>) -> String {
-    match days {
-        Some(0) => "today".into(),
-        Some(d) => format!("{d}d"),
-        None => "?".into(),
     }
 }
 
@@ -1108,10 +1094,7 @@ pub fn status(at: &Where, json: bool) -> Result<ExitCode> {
     }
     println!("flake {}", ctx.flake.display());
     if !pins_path.exists() {
-        println!(
-            "no pins.json in {}; nixheal creates it on its first build",
-            ctx.flake.display()
-        );
+        println!("no pins.json in {}", ctx.flake.display());
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -1132,7 +1115,7 @@ pub fn status(at: &Where, json: bool) -> Result<ExitCode> {
         }
         format!(
             "{date_text} ({}){}",
-            age_text(age),
+            crate::summary::age_text(age),
             if old { " STALE" } else { "" }
         )
     };
@@ -1242,13 +1225,6 @@ pub fn status(at: &Where, json: bool) -> Result<ExitCode> {
             String::new()
         }
     );
-    println!("  nixheal why ATTR       explains a pin");
-    println!("  nixheal retry ATTR     retries one now, keeping it if the package still fails");
-    println!("  nixheal clear ATTR     removes one");
-    println!("  nixheal clear --held   releases a hold (with --host or --home NAME)");
-    if input_pins > 0 {
-        println!("  nixheal clear --flake-input INPUT   removes a flake input's pin");
-    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -1266,7 +1242,7 @@ pub fn why(at: &Where, pick: &Pick, attr: &str) -> Result<ExitCode> {
         println!("cause:     {}", crate::summary::input_cause(pin));
         println!("failed on: {}", pin.targets.join(", "));
         if pin.retrying {
-            println!("retrying:  the lock has a newer revision that the next build tests");
+            println!("retrying:  the lock has a newer revision");
         } else {
             println!("retried:   once upstream has a new revision");
         }
@@ -1285,15 +1261,7 @@ pub fn why(at: &Where, pick: &Pick, attr: &str) -> Result<ExitCode> {
         let held = file
             .entry(target.kind, &target.name)
             .and_then(|e| e.held.as_ref())
-            .map(|h| {
-                format!(
-                    "; {target} is held since {}: {} (release with 'nixheal clear --held --{} {}')",
-                    h.since,
-                    h.reason,
-                    target.kind.noun(),
-                    target.name
-                )
-            })
+            .map(|h| format!("; {target} is held since {}: {}", h.since, h.reason))
             .unwrap_or_default();
         bail!(
             "{attr} is not pinned on {target}{}{held}",
@@ -1364,9 +1332,6 @@ pub fn why(at: &Where, pick: &Pick, attr: &str) -> Result<ExitCode> {
             }
         }
     }
-    let flag = ctx.flag_for(&target);
-    println!("  retry with:  nixheal retry {attr}{flag}");
-    println!("  remove with: nixheal clear {attr}{flag}");
     Ok(ExitCode::SUCCESS)
 }
 
@@ -1467,8 +1432,7 @@ pub fn pin(
     );
     file.save(&pins_path)?;
     log::change(&format!(
-        "pinned {target}: {attr} ({input}) at {at_rev} by hand; it stays until 'nixheal clear {attr}{}'. The next build, switch or boot applies it",
-        ctx.flag_for(&target)
+        "pinned {target}: {attr} ({input}) at {at_rev} by hand"
     ));
     Ok(ExitCode::SUCCESS)
 }
@@ -1538,7 +1502,7 @@ pub fn retry(at: &Where, pick: &Pick, attr: &str, input: Option<&str>) -> Result
     }
     file.save(&pins_path)?;
     log::change(&format!(
-        "{target}: the next build, switch or boot retries {attr} ({}): the pin goes if it builds, and stays at its revision if it still fails",
+        "{target}: retry queued for {attr} ({})",
         inputs.join(", ")
     ));
     Ok(ExitCode::SUCCESS)
@@ -1556,9 +1520,7 @@ pub fn clear_input(at: &Where, input: &str) -> Result<ExitCode> {
     }
     file.touch_inputs();
     file.save(&pins_path)?;
-    log::change(&format!(
-        "unpinned input {input}; flake.lock stays as it is until the next update moves it, and it is pinned again if it still fails then"
-    ));
+    log::change(&format!("unpinned input {input}"));
     Ok(ExitCode::SUCCESS)
 }
 
@@ -1586,9 +1548,7 @@ pub fn clear(
             bail!("{target} is not held");
         }
         file.save(&pins_path)?;
-        log::change(&format!(
-            "released {target}; the next build, switch or boot builds it with the current lock"
-        ));
+        log::change(&format!("released {target}"));
         return Ok(ExitCode::SUCCESS);
     }
     let Some(attr) = attr else {
@@ -1596,23 +1556,13 @@ pub fn clear(
     };
     let inputs = pinned_inputs(&ctx, &file, &target, attr, input)?;
     let entry = file.entry_mut(target.kind, &target.name);
-    let manual = inputs.iter().all(|i| {
-        entry
-            .get(i, attr)
-            .is_some_and(|p| p.reason == Reason::Manual)
-    });
     for i in &inputs {
         entry.remove(i, attr);
     }
     file.save(&pins_path)?;
     log::change(&format!(
-        "unpinned {target}: {attr} ({}); the next build, switch or boot builds it from the current lock{}",
-        inputs.join(", "),
-        if manual {
-            ""
-        } else {
-            ", and pins it again at the revision it last built with if it still fails"
-        }
+        "unpinned {target}: {attr} ({})",
+        inputs.join(", ")
     ));
     Ok(ExitCode::SUCCESS)
 }

@@ -1,5 +1,40 @@
 # Changelog
 
+## Unreleased
+
+Less output:
+
+- nixheal no longer advertises flags, options and commands while it runs, or
+  describes what a later run will do: that is in `--help` and the README. `status`
+  and `why` lose their footers of follow-up commands. An error that stops the run
+  still says how to get past it.
+- `-v` now also shows nixheal's reasoning, which is no longer shown by default:
+  each target that built, why a package set was not pinned, what a merge took,
+  and where roots went. `-q` is unchanged.
+- Hold reasons in `pins.json` are shorter, without the advice they ended in.
+
+Faster runs:
+
+- Targets evaluate side by side, up to four at once, so a fleet's rounds take
+  less time and more memory at their peak.
+- The checks of existing pins before the first round take one evaluation per
+  target, instead of one per pin, revision and donor.
+- A flake input the failure visibly involves (its source is in the failed build,
+  or its path in the evaluation error) is tested first when looking for which
+  input to roll back. It still has to prove itself.
+- An evaluation failure that is traced through several packages checks them in
+  one evaluation per package set, and remembers the answers for the run.
+- After a failed download or a killed builder only those are built once more, not
+  a real failure next to them, which may take long and would fail again.
+
+Fixes:
+
+- `--timeout` could be overrun by a whole build: when it passed during some of
+  nixheal's nix commands, nothing was stopped, and the next build ran to its end.
+  Every nix command now stops at the deadline, and nothing new starts after it. A
+  SIGTERM now stops all of them too.
+- A locked input containing `''` or `${` no longer stops nixheal from evaluating it.
+
 ## 0.1.5
 
 Flake inputs that break a build go back in `flake.lock`:

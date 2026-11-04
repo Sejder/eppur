@@ -59,18 +59,61 @@ pub struct Engine {
     /// Every target the flake has, e.g. "host a", whether or not this run or
     /// this machine's config covers it; None when its outputs do not evaluate.
     pub flake_targets: Option<Vec<String>>,
+    /// The names in nixosConfigurations and homeConfigurations, each None
+    /// when that output does not evaluate: its targets are held for that by
+    /// their probes.
+    pub host_names: Option<Vec<String>>,
+    pub home_names: Option<Vec<String>>,
     /// Whether a target with no pin to help may have flake inputs rolled back;
     /// off once a rollback in this run did not help.
     pub may_roll_back: bool,
     pub retry_same_after_days: i64,
     /// Evaluated copies of packages, by target, attr, revision and overlays.
     pub copies: std::cell::RefCell<HashMap<String, Option<Copy>>>,
+    /// Whether a package set lost an attr between two revisions, by old
+    /// revision, new revision, system and attr.
+    pub lost: std::cell::RefCell<HashMap<(String, String, String, String), bool>>,
+}
+
+/// Something a run changed, for the closing line and the commit message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Change {
+    Pinned(String),
+    Unpinned(String),
+    Held(String),
+    Released(String),
+    Moved(String),
+}
+
+impl Change {
+    /// How the closing line counts it.
+    pub fn word(&self) -> &'static str {
+        match self {
+            Change::Pinned(_) => "pinned",
+            Change::Unpinned(_) => "unpinned",
+            Change::Held(_) => "held",
+            Change::Released(_) => "released",
+            Change::Moved(_) => "moved to a donor",
+        }
+    }
+}
+
+impl std::fmt::Display for Change {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Change::Pinned(what) => write!(f, "pinned {what}"),
+            Change::Unpinned(what) => write!(f, "unpinned {what}"),
+            Change::Held(what) => write!(f, "held {what}"),
+            Change::Released(what) => write!(f, "released {what}"),
+            Change::Moved(what) => write!(f, "moved pin {what}"),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
 pub struct Report {
     /// One line per pin, unpin, hold and release, for logs and commit messages.
-    pub changes: Vec<String>,
+    pub changes: Vec<Change>,
     pub local_failure: Option<String>,
     /// The local machine's built system, for switching without evaluating it again.
     pub local_drv: Option<String>,
@@ -104,6 +147,10 @@ enum Status {
     Done,
     Failed(String),
 }
+
+const PROBE: &str = "c: { enable = c.enable or false; name = c.name or \"\"; \
+                     pins = if (c.pinsFile or null) == null then null else toString c.pinsFile; \
+                     sets = builtins.attrNames (c.packageSets or { }); }";
 
 /// One failure to pin around: a package, as every package set that provides
 /// it names it. The members are pinned, retried and reported together.
@@ -191,10 +238,27 @@ impl Engine {
             }
         }
         let original = PinsFile::load(&self.pins_path)?;
+        // What each target needs evaluated before its first round, side by
+        // side: each of these evaluates a whole configuration.
+        let nix = &self.nix;
+        let probes = crate::nix::parallel_map(&self.targets, |t| {
+            nix.eval_apply(&t.nixheal_config(), PROBE)
+        });
+        let requests: Vec<(&Target, Vec<CopyRequest>)> = self
+            .targets
+            .iter()
+            .map(|t| (t, self.copy_requests(original.entry(t.kind, &t.name))))
+            .collect();
+        for found in crate::nix::parallel_map(&requests, |(t, r)| fetch_copies(nix, t, r)) {
+            self.copies
+                .borrow_mut()
+                .extend(found.into_iter().map(|(key, copy)| (key, Some(copy))));
+        }
         let mut states: Vec<State> = self
             .targets
             .iter()
-            .map(|t| self.init(&original, t))
+            .zip(probes)
+            .map(|(t, probe)| self.init(&original, t, probe))
             .collect::<Result<_>>()?;
 
         for round in 1..=self.max_rounds {
@@ -227,9 +291,7 @@ impl Engine {
                     format!(" with {}", plural(pins, "pinned package"))
                 }
             ));
-            let started = std::time::Instant::now();
-            let new_before: usize = active.iter().map(|&i| states[i].new_pins).sum();
-            self.round(&mut states, &active)?;
+            self.round(&mut states, &active, round == self.max_rounds)?;
             if active.iter().any(|&i| states[i].status == Status::Done) {
                 let source = self.nix.source_path().ok();
                 for &i in &active {
@@ -238,7 +300,6 @@ impl Engine {
                     }
                 }
             }
-            let new_after: usize = active.iter().map(|&i| states[i].new_pins).sum();
             if active
                 .iter()
                 .any(|&i| matches!(states[i].status, Status::Failed(_)))
@@ -246,16 +307,6 @@ impl Engine {
                 log::flush_nix_errors();
             } else {
                 log::discard_nix_errors();
-                if new_after > new_before {
-                    log::info(&format!(
-                        "the errors above were handled: pinned {}, building again",
-                        plural(new_after - new_before, "package")
-                    ));
-                }
-            }
-            let took = started.elapsed().as_secs();
-            if took >= 5 {
-                log::info(&format!("round {round} took {took}s"));
             }
         }
 
@@ -265,11 +316,13 @@ impl Engine {
                     Status::Failed(format!("still failing after {} rounds", self.max_rounds));
             }
         }
+        // A nix command stopped by --timeout says nothing about any target.
+        crate::nix::check_stopped()?;
         if !self.may_roll_back {
             for st in &states {
                 if matches!(st.status, Status::Failed(_)) && st.unpinnable.borrow().is_some() {
-                    log::info(&format!(
-                        "{}: no flake input is rolled back for this in this run; see Flake input in the README",
+                    log::detail(&format!(
+                        "{}: no flake input is rolled back for this in this run",
                         st.target
                     ));
                 }
@@ -351,7 +404,7 @@ impl Engine {
                         self.reproduces(st, &cause)?
                     };
                     if let Some(baseline) = baseline {
-                        for input in &candidates {
+                        for input in &self.suspects_first(st, &cause, &candidates) {
                             let Some(locked) = revision(input) else {
                                 continue;
                             };
@@ -410,6 +463,46 @@ impl Engine {
         Ok(found.into_values().collect())
     }
 
+    /// The candidate inputs in the order to test them: those whose source the
+    /// failure visibly involves first, since each test evaluates a whole
+    /// system. Only an order: the test still has to prove it, and a source that
+    /// was filtered on its way into the build just leaves the order as it was.
+    fn suspects_first(&self, st: &State, cause: &Unpinnable, candidates: &[String]) -> Vec<String> {
+        if candidates.len() < 2 {
+            return candidates.to_vec();
+        }
+        let locked: Option<Vec<Value>> =
+            candidates.iter().map(|i| self.new_lock.locked(i)).collect();
+        let Some(locked) = locked else {
+            return candidates.to_vec();
+        };
+        let Ok(paths) = crate::nix::source_paths(&locked) else {
+            return candidates.to_vec();
+        };
+        let evidence = match &cause.failed_drv {
+            Some(drv) => self.nix.show_drvs(std::slice::from_ref(drv)).map(|graph| {
+                graph
+                    .nodes
+                    .into_values()
+                    .flat_map(|n| n.srcs)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }),
+            None => self
+                .nix
+                .eval_trace(&format!("{}.drvPath", st.target.output())),
+        };
+        let Ok(evidence) = evidence else {
+            return candidates.to_vec();
+        };
+        let marks: Vec<Vec<String>> = locked
+            .iter()
+            .zip(&paths)
+            .map(|(l, path)| source_marks(l, path))
+            .collect();
+        evidence_first(candidates, &marks, |mark| evidence.contains(mark))
+    }
+
     /// Whether the failure is still there without changing anything, built or
     /// evaluated again, since a flaky test or a failed fetch would otherwise
     /// look fixed by the first input tried. Returns the target's closure as it
@@ -421,10 +514,7 @@ impl Engine {
                 &cause.failed_drv,
             ) {
                 (Ok(drv), Some(failed)) => {
-                    let closure = self
-                        .nix
-                        .show_drvs(std::slice::from_ref(&drv))?
-                        .closure(&drv);
+                    let closure = crate::nix::drv_closure(&drv)?;
                     let still = closure.contains(failed)
                         && !self.nix.builds(std::slice::from_ref(failed))?;
                     Ok(still.then_some(closure))
@@ -492,10 +582,7 @@ impl Engine {
             let Some(failed) = &cause.failed_drv else {
                 return Ok(true);
             };
-            let closure = self
-                .nix
-                .show_drvs(std::slice::from_ref(&drv))?
-                .closure(&drv);
+            let closure = crate::nix::drv_closure(&drv)?;
             if closure.contains(failed) {
                 return Ok(false);
             }
@@ -522,30 +609,32 @@ impl Engine {
     /// homes would otherwise be held as a configuration that does not
     /// evaluate, and recorded in pins.json.
     fn check_targets(&self) -> Result<()> {
-        for (kind, output, option) in [
-            (Kind::Nixos, "nixosConfigurations", "hosts"),
-            (Kind::Home, "homeConfigurations", "homes"),
+        for (kind, output, option, known) in [
+            (
+                Kind::Nixos,
+                "nixosConfigurations",
+                "hosts",
+                &self.host_names,
+            ),
+            (Kind::Home, "homeConfigurations", "homes", &self.home_names),
         ] {
+            let Some(names) = known else {
+                continue;
+            };
             let wanted: Vec<&Target> = self.targets.iter().filter(|t| t.kind == kind).collect();
             if wanted.is_empty() {
                 continue;
             }
-            let names: Vec<String> = match self.nix.eval_apply(output, "builtins.attrNames") {
-                Ok(v) => serde_json::from_value(v)?,
-                Err(e) if e.to_string().contains("does not provide attribute") => {
-                    bail!(
-                        "programs.nixheal.{option} lists {}, but the flake has no {output}",
-                        wanted
-                            .iter()
-                            .map(|t| t.name.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )
-                }
-                // The flake's outputs do not evaluate at all: each target is
-                // held for that by its probe.
-                Err(_) => continue,
-            };
+            if names.is_empty() {
+                bail!(
+                    "programs.nixheal.{option} lists {}, but the flake has no {output}",
+                    wanted
+                        .iter()
+                        .map(|t| t.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
             let missing: Vec<&str> = wanted
                 .iter()
                 .filter(|t| !names.contains(&t.name))
@@ -562,7 +651,51 @@ impl Engine {
         Ok(())
     }
 
-    fn init(&self, original: &PinsFile, target: &Target) -> Result<State> {
+    /// What the startup checks of `entry`'s pins will ask `copy` for, so they
+    /// can all be evaluated at once: whether a moved pin's package changed, the
+    /// donors of a leaf pin, and a version not recorded yet.
+    fn copy_requests(&self, entry: Option<&Entry>) -> Vec<CopyRequest> {
+        let mut requests: Vec<CopyRequest> = Vec::new();
+        let Some(entry) = entry else {
+            return requests;
+        };
+        for (input, attr, pin) in entry.iter() {
+            if pin.reason == Reason::Manual {
+                continue;
+            }
+            let overlays = pin.overlays.unwrap_or(false);
+            let mut want = |locked: Value, overlays: bool| {
+                requests.push(CopyRequest {
+                    attr: attr.to_string(),
+                    locked,
+                    overlays,
+                })
+            };
+            if pin.reason == Reason::Build
+                && pin.root_drv.is_some()
+                && self.retry_same_after_days > 0
+                && !pin.checked_nar_hash.is_empty()
+                && self.new_lock.nar_hash(input).as_deref() != Some(pin.checked_nar_hash.as_str())
+                && let Some(new) = self.new_lock.locked(input)
+            {
+                want(new, true);
+            }
+            if pin.version.is_none() {
+                want(pin.locked.clone(), overlays);
+            }
+            if pin.reason == Reason::Build && pin.leaf && !self.donors.is_empty() {
+                want(pin.locked.clone(), overlays);
+                for donor in &self.donors {
+                    if let Some(locked) = self.new_lock.locked(donor) {
+                        want(locked, overlays);
+                    }
+                }
+            }
+        }
+        requests
+    }
+
+    fn init(&self, original: &PinsFile, target: &Target, probe: Result<Value>) -> Result<State> {
         let base = original.entry(target.kind, &target.name).cloned();
         let mut entry = base.clone().unwrap_or_default();
         let held_before = entry.held.take();
@@ -602,20 +735,12 @@ impl Engine {
                     }
                 }
                 log::info(&format!(
-                    "{target}: {attr} ({}): {input} moved, but {attr} is still the derivation that failed, so it is not built again; it is retried once that changes, or from {until} (nixheal retry {attr} retries it now)",
+                    "{target}: {attr} ({}): same failed derivation, not rebuilt until {until}",
                     group.join(", ")
                 ));
                 continue;
             }
-            let why = if asked {
-                "a retry was asked for (nixheal retry)".to_string()
-            } else {
-                format!("{input} moved since it was pinned")
-            };
-            log::info(&format!(
-                "retrying {target}: {attr} ({}): {why}",
-                group.join(", ")
-            ));
+            log::info(&format!("retrying {target}: {attr} ({})", group.join(", ")));
             for i in group {
                 if let Some(pin) = entry.remove(&i, &attr) {
                     retrying.insert((i, attr.clone()), pin);
@@ -627,7 +752,7 @@ impl Engine {
         entry.checked_last_modified = self.new_lock.last_modified();
 
         let unpinnable = std::cell::RefCell::new(None);
-        let (inputs, status) = match self.probe(target)? {
+        let (inputs, status) = match self.probe(target, probe)? {
             Ok(sets) => (sets, Status::Active),
             Err(why) => {
                 unpinnable.replace(Some(Unpinnable {
@@ -722,15 +847,12 @@ impl Engine {
         locked: &serde_json::Value,
         overlays: bool,
     ) -> Option<Copy> {
-        let key = format!(
-            "{target}\0{attr}\0{}\0{overlays}",
-            locked["narHash"].as_str().unwrap_or_default()
-        );
+        let key = copy_key(target, attr, locked, overlays);
         if let Some(hit) = self.copies.borrow().get(&key) {
             return hit.clone();
         }
-        let json = serde_json::to_string(locked).ok()?;
-        if !resolve::is_attr_name(attr) || json.contains("''") || json.contains("${") {
+        let literal = crate::nix::nix_json(locked).ok()?;
+        if !resolve::is_attr_name(attr) {
             return None;
         }
         let via = |with: bool| {
@@ -738,7 +860,7 @@ impl Engine {
                 .eval_apply(
                     &target.nixheal_config(),
                     &format!(
-                        "c: if !(c ? importPinned) then {{ none = true; }} else let p = c.importPinned {{ locked = builtins.fromJSON ''{json}''; overlays = {with}; }}; in {}",
+                        "c: if !(c ? importPinned) then {{ none = true; }} else let p = c.importPinned {{ locked = {literal}; overlays = {with}; }}; in {}",
                         resolve::copy_expr(attr)
                     ),
                 )
@@ -762,14 +884,7 @@ impl Engine {
                 .map(|v| (v, Some(false))),
             _ => None,
         };
-        let copy = value.and_then(|(v, overlays)| {
-            Some(Copy {
-                drv: v["drv"].as_str()?.to_string(),
-                out: v["out"].as_str()?.to_string(),
-                version: v["version"].as_str()?.to_string(),
-                overlays,
-            })
-        });
+        let copy = value.and_then(|(v, overlays)| copy_from(&v, overlays));
         self.copies.borrow_mut().insert(key, copy.clone());
         copy
     }
@@ -859,11 +974,8 @@ impl Engine {
     /// do nothing stops the run. A configuration that does not evaluate at all,
     /// such as one setting an option the update removed, is that target's
     /// problem: it comes back as the reason to hold it.
-    fn probe(&self, target: &Target) -> Result<Result<Vec<String>, String>> {
-        let apply = "c: { enable = c.enable or false; name = c.name or \"\"; \
-                     pins = if (c.pinsFile or null) == null then null else toString c.pinsFile; \
-                     sets = builtins.attrNames (c.packageSets or { }); }";
-        let probe: Probe = match self.nix.eval_apply(&target.nixheal_config(), apply) {
+    fn probe(&self, target: &Target, value: Result<Value>) -> Result<Result<Vec<String>, String>> {
+        let probe: Probe = match value {
             Ok(v) => serde_json::from_value(v)?,
             Err(e) => {
                 let text = e.to_string();
@@ -925,17 +1037,18 @@ impl Engine {
         Ok(file.to_bytes())
     }
 
-    fn round(&self, states: &mut [State], active: &[usize]) -> Result<()> {
+    fn round(&self, states: &mut [State], active: &[usize], last_round: bool) -> Result<()> {
         // Evaluate each host once and build what evaluated, in one nom view.
         // The drvs are kept, so a failure is traced without evaluating again.
         let mut monitor = Monitor::start();
         let mut built: Vec<(usize, String)> = Vec::new();
         let mut eval_failed: Vec<(usize, Vec<String>)> = Vec::new();
-        for &i in active {
-            match self
-                .nix
-                .drv_path(&states[i].target.output(), &mut monitor)?
-            {
+        let outputs: Vec<String> = active.iter().map(|&i| states[i].target.output()).collect();
+        for (&i, evaluated) in active
+            .iter()
+            .zip(self.nix.drv_paths(&outputs, &mut monitor)?)
+        {
+            match evaluated {
                 Ok(drv) => built.push((i, drv)),
                 Err(msgs) => eval_failed.push((i, msgs)),
             }
@@ -954,14 +1067,37 @@ impl Engine {
 
         // A download or a builder killed by a signal may have failed for the
         // moment only (the network, memory); one retry tells that apart from
-        // a real breakage before anything is pinned or the run stops.
-        if let (Some(first), Some(graph)) = (&outcome, &graph)
-            && self.looks_transient(&first.errors, graph)
-        {
-            log::info("a download or a killed builder failed; building once more before deciding");
-            let mut monitor = Monitor::start();
-            outcome = Some(self.nix.build_drvs(&drvs, &mut monitor)?);
-            monitor.finish();
+        // a real breakage before anything is pinned or the run stops. Only
+        // those are retried: a real failure next to them would fail again, and
+        // may take long to. What the retry says about them replaces what the
+        // first build said. When nothing is left failing, or in the last round,
+        // where nothing can be left for a next one, the whole build runs again.
+        let mut retried_drvs: HashSet<String> = HashSet::new();
+        let mut retry_errors: Vec<String> = Vec::new();
+        if let (Some(first), Some(graph)) = (&outcome, &graph) {
+            let transient = transient_drvs(&first.errors, graph);
+            if !transient.is_empty() {
+                log::info("a download or a killed builder failed; building once more");
+                let mut monitor = Monitor::start();
+                let retried = self.nix.build_drvs(&transient, &mut monitor)?;
+                let named = logparse::failed_drvs(&retried.errors);
+                // Failed without naming a derivation: the retry says nothing.
+                if retried.success || !named.is_empty() {
+                    let others = logparse::parse(&first.errors).into_iter().any(|f| match f {
+                        Failure::Build { drv } | Failure::Infra { drv, .. } => {
+                            !transient.contains(&drv)
+                        }
+                        _ => false,
+                    });
+                    if (others || !retried.success) && !last_round {
+                        retried_drvs.extend(transient);
+                        retry_errors = retried.errors;
+                    } else {
+                        outcome = Some(self.nix.build_drvs(&drvs, &mut monitor)?);
+                    }
+                }
+                monitor.finish();
+            }
         }
 
         if let Some(outcome) = outcome {
@@ -974,7 +1110,17 @@ impl Engine {
                     states[*i].drv = Some(drv.clone());
                 }
             } else {
-                let parsed = logparse::parse(&outcome.errors);
+                let superseded = |f: &Failure| match f {
+                    Failure::Build { drv } | Failure::Infra { drv, .. } => {
+                        retried_drvs.contains(drv)
+                    }
+                    _ => false,
+                };
+                let parsed: Vec<Failure> = logparse::parse(&outcome.errors)
+                    .into_iter()
+                    .filter(|f| !superseded(f))
+                    .chain(logparse::parse(&retry_errors))
+                    .collect();
                 let infra: Vec<(&String, &String)> = parsed
                     .iter()
                     .filter_map(|f| match f {
@@ -983,8 +1129,20 @@ impl Engine {
                     })
                     .collect();
                 let graph = graph.expect("shown for a failed build");
-                let failed = build_failures(&outcome.errors);
-                let not_built = logparse::failed_drvs(&outcome.errors);
+                let failed: Vec<String> = parsed
+                    .iter()
+                    .filter_map(|f| match f {
+                        Failure::Build { drv } => Some(drv.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                let mut not_built = logparse::failed_drvs(&outcome.errors);
+                not_built.extend(logparse::failed_drvs(&retry_errors));
+                let again = logparse::failed_drvs(&retry_errors);
+                let recovered: Vec<&String> = retried_drvs
+                    .iter()
+                    .filter(|d| !again.contains(*d))
+                    .collect();
                 let why = outcome
                     .errors
                     .last()
@@ -1009,13 +1167,13 @@ impl Engine {
                     // the package's: the host waits for it, without a pin.
                     if let Some((drv, reason)) = infra.iter().find(|(d, _)| closure.contains(*d)) {
                         st.status = Status::Failed(format!(
-                            "{} could not run on this machine ({reason}), which a pin cannot fix",
+                            "{} could not run on this machine ({reason})",
                             graph.display_name(drv)
                         ));
+                    } else if mine.is_empty() && recovered.iter().any(|d| closure.contains(*d)) {
+                        // Only held up by what recovered: the next round builds it.
                     } else if mine.is_empty() && (own_build_failed || !crate::nix::is_built(top)?) {
-                        st.status = Status::Failed(format!(
-                            "its system did not build, and nix reported no failure nixheal can pin: {why}"
-                        ));
+                        st.status = Status::Failed(format!("its system did not build: {why}"));
                     } else if mine.is_empty() {
                         st.status = Status::Done;
                         st.drv = Some(top.clone());
@@ -1034,9 +1192,7 @@ impl Engine {
                 Failure::Refused { attr, reason } => Some((attr, reason)),
                 _ => None,
             }) {
-                st.status = Status::Failed(format!(
-                    "nixpkgs refuses {attr} because {reason}; nixheal does not pin around that, so allow it or stop using it"
-                ));
+                st.status = Status::Failed(format!("nixpkgs refuses {attr} because {reason}"));
                 continue;
             }
             let attrs: Vec<String> = parsed
@@ -1054,9 +1210,7 @@ impl Engine {
                     failed_drv: None,
                     error: why.clone(),
                 }));
-                st.status = Status::Failed(format!(
-                    "evaluation fails in a way nixheal cannot pin: {why}"
-                ));
+                st.status = Status::Failed(format!("evaluation fails: {why}"));
                 continue;
             }
             let error = msgs.first().map(|m| logparse::headline(m));
@@ -1073,17 +1227,19 @@ impl Engine {
                                 .nix
                                 .eval_trace(&format!("{}.drvPath", st.target.output()))?;
                             let full = logparse::eval_context(&[trace]);
-                            context.insert(if full.is_empty() {
+                            let frames = if full.is_empty() {
                                 logparse::eval_context(&msgs)
                             } else {
                                 full
-                            })
+                            };
+                            self.check_lost(st, &frames);
+                            context.insert(frames)
                         }
                     };
                     for outer in context {
                         let inputs = self.eval_input(st, outer)?;
                         if !inputs.is_empty() {
-                            log::info(&format!(
+                            log::detail(&format!(
                                 "{}: {attr} is not pinnable itself; {outer}, which evaluation fails inside, is",
                                 st.target
                             ));
@@ -1109,7 +1265,7 @@ impl Engine {
                             error: error.clone().unwrap_or_default(),
                         }));
                         st.status = Status::Failed(format!(
-                            "evaluation fails on {attr:?}, and no older nixpkgs that built has it, so pinning cannot help"
+                            "evaluation fails on {attr:?}, which no older nixpkgs that built has"
                         ));
                         break;
                     }
@@ -1120,32 +1276,6 @@ impl Engine {
             }
         }
         Ok(())
-    }
-
-    /// Whether a failed build may have failed only for the moment: a builder
-    /// killed by a signal, or a download (a fixed-output derivation) whose
-    /// builder failed.
-    fn looks_transient(&self, errors: &[String], graph: &Graph) -> bool {
-        let parsed = logparse::parse(errors);
-        if parsed
-            .iter()
-            .any(|f| matches!(f, Failure::Infra { reason, .. } if reason.contains("due to signal")))
-        {
-            return true;
-        }
-        let failed: Vec<&String> = parsed
-            .iter()
-            .filter_map(|f| match f {
-                Failure::Build { drv } => Some(drv),
-                _ => None,
-            })
-            .collect();
-        if failed.is_empty() || errors.iter().any(|m| m.contains("hash mismatch")) {
-            return false;
-        }
-        failed
-            .iter()
-            .any(|d| graph.nodes.get(d.as_str()).is_some_and(|n| n.fixed_output))
     }
 
     fn build_wanted(
@@ -1221,7 +1351,7 @@ impl Engine {
                         });
                 if dependents > MAX_DEPENDENTS {
                     return Ok(Err(format!(
-                        "{} is used by {} other packages; pinning it would rebuild them all from source",
+                        "{} is used by {} other packages, too many to pin",
                         graph.display_name(root),
                         if dependents == usize::MAX {
                             "too many".to_string()
@@ -1271,27 +1401,82 @@ impl Engine {
             return Ok(retried);
         }
         let mut found = Vec::new();
-        let old_lock = st.held_lock.as_ref().unwrap_or(&st.old_lock);
-        let system = st.system.get_or_init(|| {
-            self.nix
-                .eval_raw(&st.target.system_attr())
-                .unwrap_or_else(|_| self.system.clone())
-        });
-        for input in &st.inputs {
-            let (Some(old), Some(new)) = (old_lock.locked(input), self.new_lock.locked(input))
-            else {
-                continue;
+        for (input, old, new) in self.moved_sets(st) {
+            let system = self.system_of(st);
+            let key = lost_key(&old, &new, system, attr);
+            let cached = self.lost.borrow().get(&key).copied();
+            let lost = match cached {
+                Some(lost) => lost,
+                None => {
+                    let one = [attr.to_string()];
+                    let lost = resolve::lost_between(&old, &new, system, &one)?
+                        .get(attr)
+                        .copied()
+                        .unwrap_or(false);
+                    self.lost.borrow_mut().insert(key, lost);
+                    lost
+                }
             };
-            if old["narHash"] == new["narHash"] {
-                continue;
-            }
-            if resolve::evaluates_at(&old, system, attr)?
-                && !resolve::evaluates_at(&new, system, attr)?
-            {
-                found.push(input.clone());
+            if lost {
+                found.push(input);
             }
         }
         Ok(found)
+    }
+
+    /// Answer `eval_input` for all of `attrs` in one evaluation per package
+    /// set. One that fails on an attr, in a way tryEval cannot catch, answers
+    /// nothing, and they are asked one at a time, as far as that gets.
+    fn check_lost(&self, st: &State, attrs: &[String]) {
+        let attrs: Vec<String> = attrs
+            .iter()
+            .filter(|a| resolve::is_attr_name(a))
+            .cloned()
+            .collect();
+        let system = self.system_of(st);
+        for (_, old, new) in self.moved_sets(st) {
+            let missing: Vec<String> = attrs
+                .iter()
+                .filter(|a| {
+                    !self
+                        .lost
+                        .borrow()
+                        .contains_key(&lost_key(&old, &new, system, a))
+                })
+                .cloned()
+                .collect();
+            if missing.len() < 2 {
+                continue;
+            }
+            if let Ok(answers) = resolve::lost_between(&old, &new, system, &missing) {
+                let mut lost = self.lost.borrow_mut();
+                for (attr, answer) in answers {
+                    lost.insert(lost_key(&old, &new, system, &attr), answer);
+                }
+            }
+        }
+    }
+
+    /// The target's package sets that moved since it last built, as (input,
+    /// last good revision, new revision).
+    fn moved_sets(&self, st: &State) -> Vec<(String, Value, Value)> {
+        let old_lock = st.held_lock.as_ref().unwrap_or(&st.old_lock);
+        st.inputs
+            .iter()
+            .filter_map(|input| {
+                let old = old_lock.locked(input)?;
+                let new = self.new_lock.locked(input)?;
+                (old["narHash"] != new["narHash"]).then(|| (input.clone(), old, new))
+            })
+            .collect()
+    }
+
+    fn system_of<'a>(&'a self, st: &'a State) -> &'a str {
+        st.system.get_or_init(|| {
+            self.nix
+                .eval_raw(&st.target.system_attr())
+                .unwrap_or_else(|_| self.system.clone())
+        })
     }
 
     fn apply(&self, st: &mut State, wanted: Result<Vec<Wanted>, String>) {
@@ -1321,9 +1506,7 @@ impl Engine {
                 .iter()
                 .find(|(_, a)| resolve::denied(a, &self.deny))
             {
-                return Err(format!(
-                    "{input}.{attr} fails and is on the never-pin list (the built-in core packages, or programs.nixheal.deny)"
-                ));
+                return Err(format!("{input}.{attr} fails and is on the never-pin list"));
             }
             // (attr, input, why not) for each set that cannot take the pin.
             let mut skipped: Vec<(String, String, String)> = Vec::new();
@@ -1414,9 +1597,7 @@ impl Engine {
                     skipped.push((
                         attr.clone(),
                         input.clone(),
-                        format!(
-                            "{input} is still at the revision this host last built with, so there is no older revision to pin it to; it is retried once {input} moves"
-                        ),
+                        format!("{input} is still at the revision this host last built with"),
                     ));
                     continue;
                 }
@@ -1496,7 +1677,7 @@ impl Engine {
                 }
             }
             for (a, i, why) in skipped {
-                log::info(&format!("{}: not pinning {a} ({i}): {why}", st.target));
+                log::detail(&format!("{}: not pinning {a} ({i}): {why}", st.target));
             }
         }
         Ok(())
@@ -1598,14 +1779,16 @@ impl Engine {
             file.inputs.remove(&name);
             file.touch_inputs();
             log::change(&format!("unpinned input {name}: builds again"));
-            report.changes.push(format!("unpinned input {name}"));
+            report
+                .changes
+                .push(Change::Unpinned(format!("input {name}")));
         }
         for (name, pin) in &file.inputs {
             if let Some(days) = date::parse(&pin.since).map(|d| self.today - d)
                 && days > self.warn_after_days
             {
                 log::warn(&format!(
-                    "flake input {name} has been held back for {days} days (warn after {}); see nixheal why {name}",
+                    "flake input {name} has been held back for {days} days (warn after {})",
                     self.warn_after_days
                 ));
             }
@@ -1635,7 +1818,9 @@ impl Engine {
                                 "unpinned {target}: {attr} ({}): builds again",
                                 inputs.join(", ")
                             ));
-                            report.changes.push(format!("unpinned {target}: {attr}"));
+                            report
+                                .changes
+                                .push(Change::Unpinned(format!("{target}: {attr}")));
                         } else {
                             log::info(&format!(
                                 "{target}: {attr} no longer needs its pin in {}; still pinned in {}",
@@ -1646,7 +1831,7 @@ impl Engine {
                     }
                     if st.held_before.is_some() {
                         log::change(&format!("released {target}: it builds with the new lock"));
-                        report.changes.push(format!("released {target}"));
+                        report.changes.push(Change::Released(target.to_string()));
                     }
                     let previous = st.base.as_ref();
                     for (attr, pins) in st.entry.packages() {
@@ -1656,9 +1841,10 @@ impl Engine {
                             .map(|(i, _)| *i)
                             .collect();
                         if !new.is_empty() {
-                            report
-                                .changes
-                                .push(format!("pinned {target}: {attr} ({})", new.join(", ")));
+                            report.changes.push(Change::Pinned(format!(
+                                "{target}: {attr} ({})",
+                                new.join(", ")
+                            )));
                         }
                         self.log_age(&target, attr, pins[0].1);
                     }
@@ -1669,14 +1855,14 @@ impl Engine {
                                 .and_then(|b| b.get(input, attr))
                                 .is_some_and(|b| b.locked != pin.locked)
                         {
-                            report
-                                .changes
-                                .push(format!("moved pin {target}: {attr} ({input}) to {donor}"));
+                            report.changes.push(Change::Moved(format!(
+                                "{target}: {attr} ({input}) to {donor}"
+                            )));
                         }
                     }
                     report.built_pins.push((target.clone(), st.entry.clone()));
                     file.set(target.kind, &target.name, st.entry);
-                    log::info(&format!("{target} builds"));
+                    log::detail(&format!("{target} builds"));
                 }
                 Status::Failed(reason) => {
                     report.held += 1;
@@ -1705,20 +1891,8 @@ impl Engine {
                     let dropped = if dropped == 0 {
                         String::new()
                     } else {
-                        format!(
-                            "; the {} pinned for it in this run {} dropped",
-                            plural(dropped, "package"),
-                            if dropped == 1 { "was" } else { "were" }
-                        )
+                        format!("; dropped {} from this run", plural(dropped, "new pin"))
                     };
-                    let release = format!(
-                        "nixheal clear --held --{} {}",
-                        match target.kind {
-                            Kind::Nixos => "host",
-                            Kind::Home => "home",
-                        },
-                        target.name
-                    );
                     let reason = reason.trim_end_matches('.').to_string();
                     let held = match st.held_before {
                         Some(mut h) => {
@@ -1730,16 +1904,11 @@ impl Engine {
                             h
                         }
                         None => {
-                            report.changes.push(format!("held {target}: {reason}"));
+                            report
+                                .changes
+                                .push(Change::Held(format!("{target}: {reason}")));
                             log::change(&format!(
-                                "held {target} on its last good lock: {reason}{dropped}. It is retried on every run and released once it builds{}",
-                                if log::is_dry_run() {
-                                    String::new()
-                                } else {
-                                    format!(
-                                        "; after fixing it yourself, '{release}' releases it now"
-                                    )
-                                }
+                                "held {target} on its last good lock: {reason}{dropped}"
                             ));
                             Held {
                                 since: date::format(self.today),
@@ -1802,8 +1971,12 @@ impl Engine {
         }
         let mut monitor = Monitor::start();
         let mut rebuild = Vec::new();
-        for target in stale {
-            let drv = match self.nix.drv_path(&target.output(), &mut monitor)? {
+        let outputs: Vec<String> = stale.iter().map(|t| t.output()).collect();
+        for (target, evaluated) in stale
+            .into_iter()
+            .zip(self.nix.drv_paths(&outputs, &mut monitor)?)
+        {
+            let drv = match evaluated {
                 Ok(d) => d,
                 Err(msgs) => bail!(
                     "{target} built, but no longer evaluates with the final pins.json: {}",
@@ -1843,13 +2016,8 @@ impl Engine {
         match date::parse(&pin.since).map(|d| self.today - d) {
             Some(days) if days > self.warn_after_days && pin.reason != Reason::Manual => {
                 log::warn(&format!(
-                    "{target}: {attr} has been pinned for {days} days (warn after {}); see nixheal why {attr}{}",
-                    self.warn_after_days,
-                    if Some(target) == self.local.as_ref() {
-                        String::new()
-                    } else {
-                        format!(" --{} {}", target.kind.noun(), target.name)
-                    }
+                    "{target}: {attr} has been pinned for {days} days (warn after {})",
+                    self.warn_after_days
                 ))
             }
             Some(_) => {}
@@ -1861,14 +2029,159 @@ impl Engine {
     }
 }
 
-fn build_failures(errors: &[String]) -> Vec<String> {
-    logparse::parse(errors)
+/// A package to evaluate at a revision before the run starts.
+#[derive(Debug, Clone)]
+struct CopyRequest {
+    attr: String,
+    locked: Value,
+    overlays: bool,
+}
+
+fn copy_key(target: &Target, attr: &str, locked: &Value, overlays: bool) -> String {
+    format!(
+        "{target}\0{attr}\0{}\0{overlays}",
+        locked["narHash"].as_str().unwrap_or_default()
+    )
+}
+
+fn copy_from(value: &Value, overlays: Option<bool>) -> Option<Copy> {
+    Some(Copy {
+        drv: value["drv"].as_str()?.to_string(),
+        out: value["out"].as_str()?.to_string(),
+        version: value["version"].as_str()?.to_string(),
+        overlays,
+    })
+}
+
+/// The copies `requests` ask for, keyed as `Engine::copy` finds them, from one
+/// evaluation of the target that imports each revision once. Any of them can
+/// fail in a way tryEval cannot catch (an overlay that breaks on an old
+/// nixpkgs), which leaves nothing here: `copy` then asks one at a time. It also
+/// handles whatever comes back null, and a target without importPinned.
+fn fetch_copies(nix: &Nix, target: &Target, requests: &[CopyRequest]) -> Vec<(String, Copy)> {
+    let mut groups: BTreeMap<(String, bool), (Value, BTreeSet<&str>)> = BTreeMap::new();
+    for r in requests {
+        if resolve::is_attr_name(&r.attr) {
+            let hash = r.locked["narHash"].as_str().unwrap_or_default().to_string();
+            groups
+                .entry((hash, r.overlays))
+                .or_insert_with(|| (r.locked.clone(), BTreeSet::new()))
+                .1
+                .insert(&r.attr);
+        }
+    }
+    let wanted: usize = groups.values().map(|(_, attrs)| attrs.len()).sum();
+    if wanted < 2 {
+        return Vec::new();
+    }
+    let mut imports = Vec::new();
+    for ((_, overlays), (locked, attrs)) in &groups {
+        let Ok(literal) = crate::nix::nix_json(locked) else {
+            return Vec::new();
+        };
+        let fields: Vec<String> = attrs
+            .iter()
+            .map(|a| format!("\"{a}\" = {};", resolve::copy_expr(a)))
+            .collect();
+        imports.push(format!(
+            "(let p = c.importPinned {{ locked = {literal}; overlays = {overlays}; }}; in {{ {} }})",
+            fields.join(" ")
+        ));
+    }
+    let apply = format!(
+        "c: if !(c ? importPinned) then null else [ {} ]",
+        imports.join(" ")
+    );
+    let Ok(Value::Array(results)) = nix.eval_apply(&target.nixheal_config(), &apply) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for (((_, overlays), (locked, _)), result) in groups.iter().zip(&results) {
+        for (attr, value) in result.as_object().into_iter().flatten() {
+            if let Some(copy) = copy_from(value, Some(*overlays)) {
+                found.push((copy_key(target, attr, locked, *overlays), copy));
+            }
+        }
+    }
+    found
+}
+
+fn lost_key(
+    old: &Value,
+    new: &Value,
+    system: &str,
+    attr: &str,
+) -> (String, String, String, String) {
+    (
+        old["narHash"].as_str().unwrap_or_default().to_string(),
+        new["narHash"].as_str().unwrap_or_default().to_string(),
+        system.to_string(),
+        attr.to_string(),
+    )
+}
+
+/// What gives a locked input away in a build's sources or an evaluation trace.
+/// A source appears by its store object's name, which `src = ./.` inside the
+/// input turns into <hash>-<its hash>-source; nix names the files of a trace
+/// by where they came from, which is a revision or a local path.
+fn source_marks(locked: &Value, store_path: &str) -> Vec<String> {
+    let url = locked["url"]
+        .as_str()
+        .and_then(|u| u.strip_prefix("file://"));
+    [
+        store_path.rsplit('/').next(),
+        locked["rev"].as_str(),
+        url,
+        locked["path"].as_str(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|mark| !mark.is_empty())
+    .map(str::to_string)
+    .collect()
+}
+
+/// `candidates` with those having a mark that `found` confirms first, each
+/// group in its own order. `marks` runs alongside `candidates`.
+fn evidence_first(
+    candidates: &[String],
+    marks: &[Vec<String>],
+    found: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    let (first, rest): (Vec<_>, Vec<_>) = candidates
+        .iter()
+        .zip(marks)
+        .partition(|(_, marks)| marks.iter().any(|m| found(m)));
+    first
+        .into_iter()
+        .chain(rest)
+        .map(|(c, _)| c.clone())
+        .collect()
+}
+
+/// The failed drvs that may have failed only for the moment: builders killed
+/// by a signal, and downloads (fixed-output derivations) whose builder failed.
+fn transient_drvs(errors: &[String], graph: &Graph) -> Vec<String> {
+    let mismatch = errors.iter().any(|m| m.contains("hash mismatch"));
+    let mut drvs: Vec<String> = logparse::parse(errors)
         .into_iter()
         .filter_map(|f| match f {
-            Failure::Build { drv } => Some(drv),
+            Failure::Infra { drv, reason } if reason.contains("due to signal") => Some(drv),
+            Failure::Build { drv }
+                if !mismatch
+                    && graph
+                        .nodes
+                        .get(drv.as_str())
+                        .is_some_and(|n| n.fixed_output) =>
+            {
+                Some(drv)
+            }
             _ => None,
         })
-        .collect()
+        .collect();
+    drvs.sort();
+    drvs.dedup();
+    drvs
 }
 
 fn st_name(target: Option<&Target>) -> String {
@@ -1901,8 +2214,8 @@ pub fn choose_overlays(
     attr: &str,
     locked: &serde_json::Value,
 ) -> Option<bool> {
-    let json = serde_json::to_string(locked).ok()?;
-    if !resolve::is_attr_name(attr) || json.contains("''") || json.contains("${") {
+    let literal = crate::nix::nix_json(locked).ok()?;
+    if !resolve::is_attr_name(attr) {
         return None;
     }
     // Evaluated one way at a time: an overlay that breaks on the old nixpkgs
@@ -1911,7 +2224,7 @@ pub fn choose_overlays(
         nix.eval_apply(
             &target.nixheal_config(),
             &format!(
-                "c: if !(c ? importPinned) then null else {{ carry = c.pinnedOverlays or true; out = (c.importPinned {{ locked = builtins.fromJSON ''{json}''; overlays = {with}; }}).{attr}.outPath; }}"
+                "c: if !(c ? importPinned) then null else {{ carry = c.pinnedOverlays or true; out = (c.importPinned {{ locked = {literal}; overlays = {with}; }}).{attr}.outPath; }}"
             ),
         )
     };
@@ -1923,12 +2236,12 @@ pub fn choose_overlays(
             let plain = probe(false).ok().and_then(|v| out(&v));
             let changes = plain.is_some() && plain != out(&with);
             if carry && changes {
-                log::info(&format!(
-                    "{target}: {attr} ({input}) is pinned with your overlays, which change it, so it may build locally"
+                log::detail(&format!(
+                    "{target}: {attr} ({input}) is pinned with your overlays, which change it"
                 ));
             } else if !carry && changes {
                 log::warn(&format!(
-                    "{target}: {attr} ({input}) is pinned without your overlays, which change it; set programs.nixheal.pinnedOverlays = true to keep them"
+                    "{target}: {attr} ({input}) is pinned without your overlays, which change it"
                 ));
             }
             Some(carry)
@@ -2005,6 +2318,62 @@ mod tests {
             counterparts("/nix/store/ddd-top.drv", &closure, &baseline),
             ["/nix/store/eee-top.drv"]
         );
+    }
+
+    #[test]
+    fn evidence_only_changes_the_order() {
+        let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let candidates = names(&["atlas", "exta", "todo", "zed"]);
+        let marks: Vec<Vec<String>> = ["a", "e", "t", "z"].iter().map(|m| names(&[m])).collect();
+        assert_eq!(
+            evidence_first(&candidates, &marks, |m| m == "t" || m == "z"),
+            names(&["todo", "zed", "atlas", "exta"])
+        );
+        assert_eq!(evidence_first(&candidates, &marks, |_| false), candidates);
+    }
+
+    #[test]
+    fn an_input_is_known_by_its_store_name_revision_and_local_path() {
+        let git = serde_json::json!({ "type": "git", "url": "file:///tmp/ext", "rev": "abc" });
+        assert_eq!(
+            source_marks(&git, "/nix/store/h1-source"),
+            ["h1-source", "abc", "/tmp/ext"]
+        );
+        let github = serde_json::json!({ "type": "github", "rev": "abc", "url": "" });
+        assert_eq!(
+            source_marks(&github, "/nix/store/h1-source"),
+            ["h1-source", "abc"]
+        );
+    }
+
+    #[test]
+    fn only_downloads_and_killed_builders_are_transient() {
+        let mut graph = Graph::default();
+        graph.nodes.insert(
+            "/nix/store/aaa-src.tar.gz.drv".into(),
+            crate::graph::Node {
+                fixed_output: true,
+                ..Default::default()
+            },
+        );
+        graph
+            .nodes
+            .insert("/nix/store/bbb-app-1.0.drv".into(), Default::default());
+        let download = "builder for '/nix/store/aaa-src.tar.gz.drv' failed with exit code 1";
+        let compile = "builder for '/nix/store/bbb-app-1.0.drv' failed with exit code 1";
+        let killed = "builder for '/nix/store/bbb-app-1.0.drv' failed due to signal 9 (Killed)";
+        let errors = |m: &[&str]| m.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            transient_drvs(&errors(&[download, compile]), &graph),
+            ["/nix/store/aaa-src.tar.gz.drv"]
+        );
+        assert!(transient_drvs(&errors(&[compile]), &graph).is_empty());
+        assert_eq!(
+            transient_drvs(&errors(&[killed]), &graph),
+            ["/nix/store/bbb-app-1.0.drv"]
+        );
+        let mismatch = "hash mismatch in fixed-output derivation '/nix/store/aaa-src.tar.gz.drv'";
+        assert!(transient_drvs(&errors(&[mismatch]), &graph).is_empty());
     }
 
     #[test]

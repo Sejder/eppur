@@ -6,6 +6,11 @@ use serde_json::Value;
 use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, ExitStatus, Output, Stdio};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::mpsc;
+
+/// How many evaluations run at once: each holds a whole system in memory.
+const MAX_PARALLEL_EVALS: usize = 4;
 
 pub struct Nix {
     flake: String,
@@ -21,6 +26,145 @@ fn command() -> Command {
     c.args(["--extra-experimental-features", "nix-command flakes"]);
     c.args(["--option", "warn-dirty", "false"]);
     c
+}
+
+/// Stop here when the run is being interrupted or is past its --timeout.
+pub fn check_stopped() -> Result<()> {
+    crate::guard::halt_if_interrupted();
+    if crate::guard::past_deadline() {
+        bail!("stopped: the run took longer than --timeout");
+    }
+    Ok(())
+}
+
+/// Start a nix command so an interrupt or --timeout stops it too. Nothing new
+/// starts past the deadline: the deadline only stops what runs when it passes.
+fn spawn(cmd: &mut Command, what: &str) -> Result<Child> {
+    check_stopped()?;
+    let mut child = cmd.spawn().with_context(|| format!("spawning {what}"))?;
+    crate::guard::track(child.id());
+    // Stopping may have started just before it was tracked, and missed it.
+    if crate::guard::past_deadline() || crate::guard::interrupted() {
+        let _ = child.kill();
+        let _ = child.wait();
+        crate::guard::untrack(child.id());
+        check_stopped()?;
+    }
+    Ok(child)
+}
+
+/// After a command from `spawn` ended, however it ended.
+fn finished(id: u32) -> Result<()> {
+    crate::guard::untrack(id);
+    check_stopped()
+}
+
+/// Run a nix command to its end and collect its output.
+fn run(mut cmd: Command, what: &str) -> Result<Output> {
+    let child = spawn(
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+        what,
+    )?;
+    let id = child.id();
+    let out = child.wait_with_output();
+    finished(id)?;
+    out.with_context(|| format!("waiting for {what}"))
+}
+
+/// Run a nix command with internal-json logging, handing each line of its
+/// stderr to `on_line`, and collect its stdout and error messages.
+fn run_logged(
+    mut cmd: Command,
+    mut on_line: impl FnMut(&[u8]),
+) -> Result<(ExitStatus, Vec<u8>, Vec<String>)> {
+    let mut child = spawn(
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped()),
+        "nix",
+    )?;
+    let mut stdout = child.stdout.take().expect("piped stdout");
+    let collect = std::thread::spawn(move || {
+        let mut out = Vec::new();
+        stdout.read_to_end(&mut out).map(|_| out)
+    });
+
+    let mut reader = BufReader::new(child.stderr.take().expect("piped stderr"));
+    let mut errors = Vec::new();
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        if reader.read_until(b'\n', &mut buf)? == 0 {
+            break;
+        }
+        let line = String::from_utf8_lossy(&buf);
+        let line = line.trim_end();
+        if logparse::is_ignored_error(line) {
+            continue;
+        }
+        on_line(&buf);
+        if let Some(msg) = logparse::error_message(line) {
+            errors.push(msg);
+        }
+    }
+
+    let status = child.wait().context("waiting for nix");
+    finished(child.id())?;
+    let status = status?;
+    let out = collect.join().expect("stdout reader")?;
+    Ok((status, out, errors))
+}
+
+/// `f` over `items` with at most MAX_PARALLEL_EVALS at once, results in the
+/// order of `items`.
+pub fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    if items.len() < 2 {
+        return items.iter().map(f).collect();
+    }
+    let next = AtomicUsize::new(0);
+    let done = std::sync::Mutex::new(Vec::with_capacity(items.len()));
+    std::thread::scope(|scope| {
+        for _ in 0..MAX_PARALLEL_EVALS.min(items.len()) {
+            scope.spawn(|| {
+                loop {
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(item) = items.get(i) else { break };
+                    let result = f(item);
+                    done.lock().expect("a worker panicked").push((i, result));
+                }
+            });
+        }
+    });
+    let mut done = done.into_inner().expect("a worker panicked");
+    done.sort_by_key(|(i, _)| *i);
+    done.into_iter().map(|(_, r)| r).collect()
+}
+
+/// A nix string literal for `text`, whatever it contains.
+pub fn nix_string(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for c in text.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '"' => out.push_str("\\\""),
+            '$' => out.push_str("\\$"),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// A nix expression for a JSON value.
+pub fn nix_json(value: &Value) -> Result<String> {
+    Ok(format!(
+        "(builtins.fromJSON {})",
+        nix_string(&serde_json::to_string(value)?)
+    ))
 }
 
 fn tail(stderr: &[u8], lines: usize) -> String {
@@ -69,57 +213,28 @@ impl Monitor {
 
     /// Run `cmd` with internal-json logging, feeding its stderr to nom and
     /// collecting its error messages and stdout.
-    fn run(&mut self, mut cmd: Command) -> Result<(ExitStatus, Vec<u8>, Vec<String>)> {
-        let mut child = cmd
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("spawning nix")?;
-        crate::guard::track(child.id());
+    fn run(&mut self, cmd: Command) -> Result<(ExitStatus, Vec<u8>, Vec<String>)> {
+        run_logged(cmd, |line| self.line(line, true))
+    }
 
-        let mut stdout = child.stdout.take().expect("piped stdout");
-        let collect = std::thread::spawn(move || {
-            let mut out = Vec::new();
-            stdout.read_to_end(&mut out).map(|_| out)
-        });
-
-        let mut reader = BufReader::new(child.stderr.take().expect("piped stderr"));
-        let mut errors = Vec::new();
-        let mut buf = Vec::new();
-        loop {
-            buf.clear();
-            if reader.read_until(b'\n', &mut buf)? == 0 {
-                break;
-            }
-            if let Some(pipe) = &mut self.pipe
-                && pipe.write_all(&buf).is_err()
-            {
-                self.pipe = None;
-            }
-            let line = String::from_utf8_lossy(&buf);
-            if !self.active()
-                && let Some(text) = logparse::activity_text(line.trim_end())
-            {
-                log::nix_progress(&text);
-            }
-            if let Some(msg) = logparse::error_message(line.trim_end()) {
-                if !self.active() {
-                    log::nix_error(&msg);
-                }
-                errors.push(msg);
-            }
+    /// A line of a nix command's stderr: for nom on a terminal, else its
+    /// progress and, when `errors`, its error messages go to stderr.
+    fn line(&mut self, line: &[u8], errors: bool) {
+        if let Some(pipe) = &mut self.pipe
+            && pipe.write_all(line).is_err()
+        {
+            self.pipe = None;
         }
-
-        let status = child.wait().context("waiting for nix");
-        crate::guard::untrack(child.id());
-        crate::guard::halt_if_interrupted();
-        if crate::guard::timed_out() {
-            bail!("stopped: the run took longer than --timeout");
+        if self.active() {
+            return;
         }
-        let status = status?;
-        let out = collect.join().expect("stdout reader")?;
-        Ok((status, out, errors))
+        let text = String::from_utf8_lossy(line);
+        if let Some(progress) = logparse::activity_text(text.trim_end()) {
+            log::nix_progress(&progress);
+        }
+        if errors && let Some(msg) = logparse::error_message(text.trim_end()) {
+            log::nix_error(&msg);
+        }
     }
 
     pub fn finish(mut self) {
@@ -145,28 +260,22 @@ impl Nix {
     /// unless the update fails.
     pub fn flake_update(&self, inputs: &[String]) -> Result<()> {
         let quiet = log::is_quiet();
-        let mut child = command()
-            .args(["flake", "update", "--flake", &self.flake])
+        let mut cmd = command();
+        cmd.args(["flake", "update", "--flake", &self.flake])
             .args(inputs)
             .stdin(Stdio::null())
             .stderr(if quiet {
                 Stdio::piped()
             } else {
                 Stdio::inherit()
-            })
-            .spawn()
-            .context("spawning nix flake update")?;
-        crate::guard::track(child.id());
+            });
+        let mut child = spawn(&mut cmd, "nix flake update")?;
         let mut stderr = Vec::new();
         if let Some(mut e) = child.stderr.take() {
             let _ = e.read_to_end(&mut stderr);
         }
         let status = child.wait().context("waiting for nix flake update");
-        crate::guard::untrack(child.id());
-        crate::guard::halt_if_interrupted();
-        if crate::guard::timed_out() {
-            bail!("stopped: the run took longer than --timeout");
-        }
+        finished(child.id())?;
         if !status?.success() {
             if quiet {
                 eprint!("{}", String::from_utf8_lossy(&stderr));
@@ -174,25 +283,6 @@ impl Nix {
             bail!("nix flake update failed");
         }
         Ok(())
-    }
-
-    /// Run a nix command so an interrupt or --timeout stops it too.
-    fn tracked(&self, mut cmd: Command, what: &str) -> Result<Output> {
-        let child = cmd
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .with_context(|| format!("spawning {what}"))?;
-        let id = child.id();
-        crate::guard::track(id);
-        let out = child.wait_with_output();
-        crate::guard::untrack(id);
-        crate::guard::halt_if_interrupted();
-        if crate::guard::timed_out() {
-            bail!("stopped: the run took longer than --timeout");
-        }
-        out.with_context(|| format!("waiting for {what}"))
     }
 
     /// Lock these inputs at these flake references, leaving every other input
@@ -203,7 +293,7 @@ impl Nix {
         for (name, flake_ref) in inputs {
             cmd.args(["--override-input", name, flake_ref]);
         }
-        checked("nix flake lock", self.tracked(cmd, "nix flake lock")?)?;
+        checked("nix flake lock", run(cmd, "nix flake lock")?)?;
         Ok(())
     }
 
@@ -221,7 +311,7 @@ impl Nix {
             cmd.args(["--override-input", name, flake_ref]);
         }
         cmd.arg(self.installable(&format!("{attr}.drvPath")));
-        let out = self.tracked(cmd, "nix eval")?;
+        let out = run(cmd, "nix eval")?;
         if out.status.success() {
             Ok(Ok(String::from_utf8_lossy(&out.stdout).trim().to_string()))
         } else {
@@ -231,24 +321,14 @@ impl Nix {
         }
     }
 
-    /// Every host and home the flake has, e.g. "host a", or None when its
-    /// outputs do not evaluate.
-    pub fn flake_targets(&self) -> Option<Vec<String>> {
-        let mut targets = Vec::new();
-        for (noun, output) in [
-            ("host", "nixosConfigurations"),
-            ("home", "homeConfigurations"),
-        ] {
-            match self.eval_apply(output, "builtins.attrNames") {
-                Ok(names) => {
-                    let names: Vec<String> = serde_json::from_value(names).ok()?;
-                    targets.extend(names.iter().map(|n| format!("{noun} {n}")));
-                }
-                Err(e) if e.to_string().contains("does not provide attribute") => {}
-                Err(_) => return None,
-            }
+    /// The names in a flake output such as nixosConfigurations, none when the
+    /// flake has no such output; None when it does not evaluate.
+    pub fn output_names(&self, output: &str) -> Option<Vec<String>> {
+        match self.eval_apply(output, "builtins.attrNames") {
+            Ok(names) => serde_json::from_value(names).ok(),
+            Err(e) if e.to_string().contains("does not provide attribute") => Some(Vec::new()),
+            Err(_) => None,
         }
-        Some(targets)
     }
 
     /// Whether these derivations build. Not an error when they do not: this
@@ -257,26 +337,58 @@ impl Nix {
         let mut cmd = command();
         cmd.args(["build", "--no-link"]);
         cmd.args(drvs.iter().map(|d| format!("{d}^*")));
-        Ok(self.tracked(cmd, "nix build")?.status.success())
+        Ok(run(cmd, "nix build")?.status.success())
     }
 
-    /// The drvPath of `attr`, or the evaluation error messages.
-    pub fn drv_path(
+    /// The drvPath of each of `attrs`, or its evaluation error messages, in
+    /// the order of `attrs`. They evaluate side by side, on one nom view. Off a
+    /// terminal a command's errors are printed when it ends, so that those of
+    /// different targets do not run together.
+    pub fn drv_paths(
         &self,
-        attr: &str,
+        attrs: &[String],
         monitor: &mut Monitor,
-    ) -> Result<Result<String, Vec<String>>> {
-        let mut cmd = command();
-        cmd.args(["eval", "--raw", "--log-format", "internal-json"])
-            .arg(self.installable(&format!("{attr}.drvPath")));
-        let (status, out, errors) = monitor.run(cmd)?;
-        if status.success() {
-            Ok(Ok(String::from_utf8_lossy(&out).trim().to_string()))
-        } else if errors.is_empty() {
-            Ok(Err(vec![format!("nix eval {attr} failed")]))
-        } else {
-            Ok(Err(errors))
+    ) -> Result<Vec<Result<String, Vec<String>>>> {
+        enum Event {
+            Line(Vec<u8>),
+            Errors(Vec<String>),
         }
+        let (send, receive) = mpsc::channel();
+        let evaluate = |attr: &String, send: &mpsc::Sender<Event>| {
+            let mut cmd = command();
+            cmd.args(["eval", "--raw", "--log-format", "internal-json"])
+                .arg(self.installable(&format!("{attr}.drvPath")));
+            let (status, out, errors) = run_logged(cmd, |line| {
+                let _ = send.send(Event::Line(line.to_vec()));
+            })?;
+            let _ = send.send(Event::Errors(errors.clone()));
+            Ok(if status.success() {
+                Ok(String::from_utf8_lossy(&out).trim().to_string())
+            } else if errors.is_empty() {
+                Err(vec![format!("nix eval {attr} failed")])
+            } else {
+                Err(errors)
+            })
+        };
+        std::thread::scope(|scope| {
+            let workers = scope.spawn(move || {
+                parallel_map(attrs, |attr| evaluate(attr, &send.clone()))
+                    .into_iter()
+                    .collect::<Result<Vec<_>>>()
+            });
+            for event in receive {
+                match event {
+                    Event::Line(line) => monitor.line(&line, false),
+                    Event::Errors(errors) if !monitor.active() => {
+                        for msg in &errors {
+                            log::nix_error(msg);
+                        }
+                    }
+                    Event::Errors(_) => {}
+                }
+            }
+            workers.join().expect("an evaluation thread panicked")
+        })
     }
 
     /// Build already evaluated derivations in one `--keep-going` run.
@@ -301,35 +413,27 @@ impl Nix {
     }
 
     pub fn show_drvs(&self, drvs: &[String]) -> Result<Graph> {
-        let out = command()
-            .args(["derivation", "show", "--recursive"])
-            .args(drvs)
-            .stdin(Stdio::null())
-            .output()
-            .context("spawning nix derivation show")?;
+        let mut cmd = command();
+        cmd.args(["derivation", "show", "--recursive"]).args(drvs);
+        let out = run(cmd, "nix derivation show")?;
         let store = crate::graph::store_dir_of(drvs.first().map_or("", String::as_str));
         Graph::from_show_json(&checked("nix derivation show", out)?, &store)
     }
 
     pub fn eval_apply(&self, attr: &str, apply: &str) -> Result<Value> {
-        let out = command()
-            .args(["eval", "--json"])
+        let mut cmd = command();
+        cmd.args(["eval", "--json"])
             .arg(self.installable(attr))
-            .args(["--apply", apply])
-            .stdin(Stdio::null())
-            .output()
-            .context("spawning nix eval")?;
-        let bytes = checked(&format!("nix eval {attr}"), out)?;
+            .args(["--apply", apply]);
+        let bytes = checked(&format!("nix eval {attr}"), run(cmd, "nix eval")?)?;
         Ok(serde_json::from_slice(&bytes)?)
     }
 
     /// The store path of the flake's source as nix copies it now.
     pub fn source_path(&self) -> Result<String> {
-        let out = command()
-            .args(["flake", "metadata", "--json", &self.flake])
-            .stdin(Stdio::null())
-            .output()
-            .context("spawning nix flake metadata")?;
+        let mut cmd = command();
+        cmd.args(["flake", "metadata", "--json", &self.flake]);
+        let out = run(cmd, "nix flake metadata")?;
         let json: Value = serde_json::from_slice(&checked("nix flake metadata", out)?)?;
         json["path"]
             .as_str()
@@ -341,60 +445,67 @@ impl Nix {
     /// what nix shows by default is cut short before the packages an error
     /// passed through. Not shown to the user.
     pub fn eval_trace(&self, attr: &str) -> Result<String> {
-        let out = command()
-            .args(["eval", "--raw", "--show-trace"])
-            .arg(self.installable(attr))
-            .stdin(Stdio::null())
-            .output()
-            .context("spawning nix eval")?;
+        let mut cmd = command();
+        cmd.args(["eval", "--raw", "--show-trace"])
+            .arg(self.installable(attr));
+        let out = run(cmd, "nix eval")?;
         Ok(logparse::strip_ansi(&String::from_utf8_lossy(&out.stderr)))
     }
 
     pub fn eval_raw(&self, attr: &str) -> Result<String> {
-        let out = command()
-            .args(["eval", "--raw"])
-            .arg(self.installable(attr))
-            .stdin(Stdio::null())
-            .output()
-            .context("spawning nix eval")?;
-        let bytes = checked(&format!("nix eval {attr}"), out)?;
+        let mut cmd = command();
+        cmd.args(["eval", "--raw"]).arg(self.installable(attr));
+        let bytes = checked(&format!("nix eval {attr}"), run(cmd, "nix eval")?)?;
         Ok(String::from_utf8_lossy(&bytes).trim().to_string())
     }
 }
 
+/// Every derivation `drv` depends on, itself included, without parsing the
+/// derivations themselves.
+pub fn drv_closure(drv: &str) -> Result<std::collections::HashSet<String>> {
+    let mut cmd = Command::new("nix-store");
+    cmd.args(["--query", "--requisites", drv]);
+    let out = checked("nix-store --query", run(cmd, "nix-store --query")?)?;
+    Ok(String::from_utf8_lossy(&out)
+        .lines()
+        .filter(|p| p.ends_with(".drv"))
+        .map(str::to_string)
+        .collect())
+}
+
+/// The store paths of these locked inputs' sources, in their order.
+pub fn source_paths(locked: &[Value]) -> Result<Vec<String>> {
+    let expr = format!(
+        "map (l: (builtins.fetchTree l).outPath) {}",
+        nix_json(&Value::from(locked.to_vec()))?
+    );
+    Ok(serde_json::from_value(eval_expr(&expr)?)?)
+}
+
 /// Keep a built derivation alive with a GC root at `link`.
 pub fn add_root(drv: &str, link: &Path) -> Result<()> {
-    let out = command()
-        .args(["build", "--out-link"])
+    let mut cmd = command();
+    cmd.args(["build", "--out-link"])
         .arg(link)
-        .arg(format!("{drv}^out"))
-        .stdin(Stdio::null())
-        .output()
-        .context("spawning nix build")?;
-    checked(&format!("rooting {drv}"), out).map(|_| ())
+        .arg(format!("{drv}^out"));
+    checked(&format!("rooting {drv}"), run(cmd, "nix build")?).map(|_| ())
 }
 
 /// Whether every output of `drv` is in the store, i.e. it really built.
 pub fn is_built(drv: &str) -> Result<bool> {
-    let out = command()
-        .args(["path-info", "--offline"])
-        .arg(format!("{drv}^*"))
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .context("spawning nix path-info")?;
-    Ok(out.success())
+    let mut cmd = command();
+    cmd.args(["path-info", "--offline"]).arg(format!("{drv}^*"));
+    Ok(run(cmd, "nix path-info")?.status.success())
 }
 
 /// The `out` path of a built derivation, read from the drv itself.
 pub fn out_path(drv: &str) -> Result<String> {
-    let out = command()
-        .args(["derivation", "show", drv])
-        .stdin(Stdio::null())
-        .output()
-        .context("spawning nix derivation show")?;
-    let json: Value = serde_json::from_slice(&checked("nix derivation show", out)?)?;
+    let mut cmd = command();
+    cmd.args(["derivation", "show", drv]);
+    let json: Value = serde_json::from_slice(&checked(
+        "nix derivation show",
+        run(cmd, "nix derivation show")?,
+    )?)?;
     let drvs = json.get("derivations").unwrap_or(&json);
     let path = drvs
         .as_object()
@@ -412,11 +523,9 @@ pub fn out_path(drv: &str) -> Result<String> {
 fn substituters() -> &'static [String] {
     static SUBSTITUTERS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     SUBSTITUTERS.get_or_init(|| {
-        let out = command()
-            .args(["config", "show", "substituters"])
-            .stdin(Stdio::null())
-            .output();
-        match out {
+        let mut cmd = command();
+        cmd.args(["config", "show", "substituters"]);
+        match run(cmd, "nix config show") {
             Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
                 .split_whitespace()
                 .map(str::to_string)
@@ -435,23 +544,15 @@ pub fn available(out: &str) -> bool {
         if let Some(s) = store {
             cmd.args(["--store", s]);
         }
-        cmd.arg(out)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
+        cmd.arg(out);
+        run(cmd, "nix path-info").is_ok_and(|o| o.status.success())
     };
     valid(None) || substituters().iter().any(|s| valid(Some(s)))
 }
 
 /// A flake.lock node's `locked` as a flake reference for the command line.
 pub fn flake_ref(locked: &Value) -> Result<String> {
-    let json = serde_json::to_string(locked)?;
-    if json.contains("''") || json.contains("${") {
-        bail!("locked node cannot be quoted safely");
-    }
-    let expr = format!("builtins.flakeRefToString (builtins.fromJSON ''{json}'')");
+    let expr = format!("builtins.flakeRefToString {}", nix_json(locked)?);
     eval_expr(&expr)?
         .as_str()
         .map(str::to_string)
@@ -459,26 +560,40 @@ pub fn flake_ref(locked: &Value) -> Result<String> {
 }
 
 pub fn eval_expr(expr: &str) -> Result<Value> {
-    let out = command()
-        .args(["eval", "--json", "--expr", expr])
-        .stdin(Stdio::null())
-        .output()
-        .context("spawning nix eval")?;
-    let bytes = checked("nix eval --expr", out)?;
+    let mut cmd = command();
+    cmd.args(["eval", "--json", "--expr", expr]);
+    let bytes = checked("nix eval --expr", run(cmd, "nix eval")?)?;
     Ok(serde_json::from_slice(&bytes)?)
 }
 
 /// The last lines of a derivation's build log, if nix kept one.
 pub fn log_tail(drv: &str, lines: usize) -> Option<String> {
-    let out = command()
-        .args(["log", drv])
-        .stdin(Stdio::null())
-        .output()
-        .ok()?;
+    let mut cmd = command();
+    cmd.args(["log", drv]);
+    let out = run(cmd, "nix log").ok()?;
     if !out.status.success() {
         return None;
     }
     let text = logparse::strip_ansi(&String::from_utf8_lossy(&out.stdout));
     let kept: Vec<&str> = text.lines().filter(|l| !l.starts_with("@nix ")).collect();
     Some(kept[kept.len().saturating_sub(lines)..].join("\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nix_strings_escape_what_nix_would_read() {
+        assert_eq!(nix_string("plain"), r#""plain""#);
+        assert_eq!(nix_string(r#"a"b\c"#), r#""a\"b\\c""#);
+        assert_eq!(nix_string("${x} ''"), r#""\${x} ''""#);
+    }
+
+    #[test]
+    fn parallel_map_keeps_the_order() {
+        let items: Vec<usize> = (0..20).collect();
+        let doubled = parallel_map(&items, |i| i * 2);
+        assert_eq!(doubled, items.iter().map(|i| i * 2).collect::<Vec<_>>());
+    }
 }

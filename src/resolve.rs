@@ -141,12 +141,9 @@ pub fn evaluates_at(locked: &Value, system: &str, attr: &str) -> Result<bool> {
     {
         bail!("refusing to evaluate unexpected name {attr:?} for {system:?}");
     }
-    let json = serde_json::to_string(locked)?;
-    if json.contains("''") || json.contains("${") {
-        bail!("locked node cannot be quoted safely");
-    }
     let expr = format!(
-        r#"let p = import (builtins.fetchTree (builtins.fromJSON ''{json}'')) {{ system = "{system}"; config.allowUnfree = true; }}; r = builtins.tryEval (if builtins.hasAttr "{attr}" p then (builtins.getAttr "{attr}" p).drvPath else null); in r.success && r.value != null"#
+        r#"let p = import (builtins.fetchTree {}) {{ system = "{system}"; config.allowUnfree = true; }}; r = builtins.tryEval (if builtins.hasAttr "{attr}" p then (builtins.getAttr "{attr}" p).drvPath else null); in r.success && r.value != null"#,
+        nix::nix_json(locked)?
     );
     Ok(nix::eval_expr(&expr)?.as_bool().unwrap_or(false))
 }
@@ -169,16 +166,39 @@ pub fn copy_at(locked: &Value, system: &str, attr: &str) -> Result<Option<Value>
     {
         bail!("refusing to evaluate unexpected name {attr:?} for {system:?}");
     }
-    let json = serde_json::to_string(locked)?;
-    if json.contains("''") || json.contains("${") {
-        bail!("locked node cannot be quoted safely");
-    }
     let expr = format!(
-        r#"let p = import (builtins.fetchTree (builtins.fromJSON ''{json}'')) {{ system = "{system}"; config.allowUnfree = true; }}; in {}"#,
+        r#"let p = import (builtins.fetchTree {}) {{ system = "{system}"; config.allowUnfree = true; }}; in {}"#,
+        nix::nix_json(locked)?,
         copy_expr(attr)
     );
     let v = nix::eval_expr(&expr)?;
     Ok((!v.is_null()).then_some(v))
+}
+
+/// For each of `attrs`: whether it evaluates to a derivation in the nixpkgs at
+/// `old` and not in the one at `new`, each imported once. An error when any of
+/// them fails in a way tryEval cannot catch.
+pub fn lost_between(
+    old: &Value,
+    new: &Value,
+    system: &str,
+    attrs: &[String],
+) -> Result<HashMap<String, bool>> {
+    if !attrs.iter().all(|a| is_attr_name(a))
+        || !system
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        bail!("refusing to evaluate unexpected names {attrs:?} for {system:?}");
+    }
+    let names: BTreeSet<String> = attrs.iter().cloned().collect();
+    let expr = format!(
+        r#"let import' = l: import (builtins.fetchTree l) {{ system = "{system}"; config.allowUnfree = true; }}; old = import' {}; new = import' {}; has = p: a: let r = builtins.tryEval (if builtins.hasAttr a p then (builtins.getAttr a p).drvPath else null); in r.success && r.value != null; in builtins.listToAttrs (map (a: {{ name = a; value = has old a && !(has new a); }}) {})"#,
+        nix::nix_json(old)?,
+        nix::nix_json(new)?,
+        nix_list(&names)
+    );
+    Ok(serde_json::from_value(nix::eval_expr(&expr)?)?)
 }
 
 /// The next component of a version string after `*i`, as nix splits them:

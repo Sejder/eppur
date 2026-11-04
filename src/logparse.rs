@@ -139,6 +139,13 @@ pub fn activity_text(line: &str) -> Option<String> {
         .map(strip_ansi)
 }
 
+/// Whether a line of a nix command's internal-json stderr is an "error
+/// (ignored)": nix carried on without it, as when commands running side by side
+/// find its evaluation cache busy. Not a failure, and not worth showing.
+pub fn is_ignored_error(line: &str) -> bool {
+    error_message(line).is_some_and(|m| m.trim_start().starts_with("error (ignored)"))
+}
+
 /// The text of an error-level message from a `--log-format internal-json` stderr line.
 pub fn error_message(line: &str) -> Option<String> {
     let json: Value = serde_json::from_str(line.strip_prefix("@nix ")?).ok()?;
@@ -285,6 +292,21 @@ pub fn failed_drvs(messages: &[String]) -> std::collections::HashSet<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ignored_errors_are_told_apart() {
+        let line = |msg: &str| {
+            format!(
+                "@nix {}",
+                serde_json::json!({ "action": "msg", "level": 0, "msg": msg })
+            )
+        };
+        assert!(is_ignored_error(&line(
+            "error (ignored): SQLite database 'x.sqlite' is busy"
+        )));
+        assert!(!is_ignored_error(&line("error: attribute 'x' missing")));
+        assert!(!is_ignored_error("plain text"));
+    }
 
     fn fixture_messages(text: &str) -> Vec<String> {
         text.lines().filter_map(error_message).collect()
