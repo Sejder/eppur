@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.6
 
 Renamed from nixheal to eppur, after "Eppur si muove" ("and yet it moves"):
 
@@ -10,6 +10,11 @@ Renamed from nixheal to eppur, after "Eppur si muove" ("and yet it moves"):
   says so. `pins.json` is unchanged.
 - The state directory and the roots in a `--gc-roots` directory are taken over on
   the first run, so last good locks and the root of a held host are kept.
+- Switch the machine that runs eppur before it next runs on the renamed flake. The
+  old binary cannot evaluate `programs.eppur`, so with `--hold-local` it holds
+  every target and exits 0, and a pipeline that publishes after that run publishes
+  the holds. The first full run of the new binary releases them, so a pipeline that
+  skips a run when nothing changed has to be made to run once.
 
 Less output:
 

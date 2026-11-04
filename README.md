@@ -42,6 +42,10 @@ eppur was called nixheal until 0.1.5. To move over, rename the flake input,
 `EPPUR_CONFIG`. Its state directory and `--gc-roots` roots are taken over on
 the first run, and `pins.json` is unchanged.
 
+Switch the machine that runs it to the new name by hand first (with `nh` or
+`nixos-rebuild`): the old binary cannot evaluate a flake that only has
+`programs.eppur`.
+
 ## Quick start
 
 eppur is a flake. Add it, import the module on your host and point it at the
