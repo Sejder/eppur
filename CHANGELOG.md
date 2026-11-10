@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.7
+
+- An interrupted run whose terminal had been closed, such as `eppur switch` in a
+  terminal window closed mid-build, could hang instead of exiting and keep the
+  flake's lock, so every later run was refused with "another eppur run is using".
+  It now restores `flake.lock` and `pins.json` and exits 130. A run already stuck
+  this way has to be killed with `kill -9`.
+
 ## 0.1.6
 
 Renamed from nixheal to eppur, after "Eppur si muove" ("and yet it moves"):
