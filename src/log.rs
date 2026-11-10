@@ -1,5 +1,31 @@
+use std::io::Write;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
+
+/// A line to stderr. A failed write is dropped instead of panicking like
+/// eprintln!: a closed terminal must not kill the signal handler before it
+/// restores the files and exits.
+macro_rules! line {
+    ($($arg:tt)*) => {
+        emit(format_args!($($arg)*))
+    };
+}
+
+fn emit(args: std::fmt::Arguments) {
+    let mut err = std::io::stderr().lock();
+    let _ = err.write_fmt(args);
+    let _ = err.write_all(b"\n");
+}
+
+/// Text to stderr as it is, dropped if stderr is gone.
+pub fn raw(text: &str) {
+    let _ = std::io::stderr().lock().write_all(text.as_bytes());
+}
+
+/// An error that ends the run; always shown.
+pub fn error(msg: &str) {
+    line!("eppur: error: {msg}");
+}
 
 static QUIET: AtomicBool = AtomicBool::new(false);
 static DRY_RUN: AtomicBool = AtomicBool::new(false);
@@ -50,23 +76,23 @@ fn journal() -> bool {
 /// Progress; hidden with --quiet.
 pub fn info(msg: &str) {
     if !is_quiet() {
-        eprintln!("eppur: {msg}");
+        line!("eppur: {msg}");
     }
 }
 
 /// Reasoning that only matters when debugging; shown only with --verbose.
 pub fn detail(msg: &str) {
     if VERBOSE.load(Ordering::Relaxed) {
-        eprintln!("eppur: {msg}");
+        line!("eppur: {msg}");
     }
 }
 
 /// A pin, unpin, hold or release, or why eppur gave up; always shown.
 pub fn change(msg: &str) {
     if DRY_RUN.load(Ordering::Relaxed) {
-        eprintln!("eppur: (dry run) {msg}");
+        line!("eppur: (dry run) {msg}");
     } else {
-        eprintln!("eppur: {msg}");
+        line!("eppur: {msg}");
     }
 }
 
@@ -74,7 +100,7 @@ pub fn change(msg: &str) {
 /// shows progress as plain nix would; hidden with --quiet.
 pub fn nix_progress(msg: &str) {
     if !is_quiet() {
-        eprintln!("{msg}");
+        line!("{msg}");
     }
 }
 
@@ -86,7 +112,7 @@ pub fn nix_error(msg: &str) {
             held.push(msg.to_string());
         }
     } else {
-        eprintln!("{msg}");
+        line!("{msg}");
     }
 }
 
@@ -95,7 +121,7 @@ pub fn nix_error(msg: &str) {
 pub fn flush_nix_errors() {
     if let Ok(mut held) = HELD_BACK.lock() {
         for msg in held.drain(..) {
-            eprintln!("{msg}");
+            line!("{msg}");
         }
     }
 }
@@ -110,8 +136,8 @@ pub fn discard_nix_errors() {
 /// Logged at warning priority when stderr goes to the journal.
 pub fn warn(msg: &str) {
     if journal() {
-        eprintln!("<4>eppur: warning: {msg}");
+        line!("<4>eppur: warning: {msg}");
     } else {
-        eprintln!("eppur: warning: {msg}");
+        line!("eppur: warning: {msg}");
     }
 }

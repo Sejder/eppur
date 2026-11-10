@@ -189,9 +189,9 @@ fn main() -> ExitCode {
     };
     result.unwrap_or_else(|e| {
         log::flush_nix_errors();
-        eprintln!("eppur: error: {e:#}");
+        log::error(&format!("{e:#}"));
         if let Err(e) = guard::restore() {
-            eprintln!("eppur: error: restoring flake.lock and pins.json failed: {e:#}");
+            log::error(&format!("restoring flake.lock and pins.json failed: {e:#}"));
         }
         ExitCode::from(2)
     })

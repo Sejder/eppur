@@ -278,7 +278,7 @@ impl Nix {
         finished(child.id())?;
         if !status?.success() {
             if quiet {
-                eprint!("{}", String::from_utf8_lossy(&stderr));
+                crate::log::raw(&String::from_utf8_lossy(&stderr));
             }
             bail!("nix flake update failed");
         }

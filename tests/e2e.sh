@@ -612,6 +612,43 @@ cmp -s "$sys/pins.json" "$work/before.json" || fail "pins.json was not restored 
 revision fixed false 10 ok
 eppur_ build --update || fail "eppur build gave up after the interrupted run"
 
+step "interrupted after its terminal went away: the run still restores, exits and frees the lock"
+revision fixed false slow ok
+cp "$sys/flake.lock" "$work/before.lock"
+cp "$sys/pins.json" "$work/before.json"
+rm -f "$work/stderr.fifo"
+mkfifo "$work/stderr.fifo"
+cat "$work/stderr.fifo" >"$log" &
+reader=$!
+"$eppur" switch --update -q --config "$config" >"$work/stdout" 2>"$work/stderr.fifo" &
+pid=$!
+for _ in $(seq 120); do
+  pgrep -P "$pid" -f " build " >/dev/null && break
+  sleep 0.5
+done
+pgrep -P "$pid" -f " build " >/dev/null || fail "the slow build never started"
+kill "$reader"
+wait "$reader" 2>/dev/null || true
+sleep 1
+kill -TERM "$pid"
+for _ in $(seq 60); do
+  kill -0 "$pid" 2>/dev/null || break
+  sleep 0.5
+done
+if kill -0 "$pid" 2>/dev/null; then
+  kill -KILL "$pid"
+  fail "an interrupted run whose stderr was gone hung instead of exiting"
+fi
+set +e
+wait "$pid"
+rc=$?
+set -e
+[ "$rc" = 130 ] || fail "an interrupted run whose stderr was gone should exit 130, not $rc"
+cmp -s "$sys/flake.lock" "$work/before.lock" || fail "flake.lock was not restored after losing stderr"
+cmp -s "$sys/pins.json" "$work/before.json" || fail "pins.json was not restored after losing stderr"
+revision fixed false 10 ok
+eppur_ build --update || fail "eppur build gave up after the run that lost its stderr"
+
 step "--timeout: past the deadline nothing new starts, and the files are restored"
 revision fixed false 105 ok
 cp "$sys/flake.lock" "$work/before.lock"

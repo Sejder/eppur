@@ -108,13 +108,31 @@ pub fn interrupted() -> bool {
 }
 
 /// After a nix command returned: if the run is being interrupted, wait for
-/// the signal handler, which restores the files and exits.
+/// the signal handler, which restores the files and exits. Should it not
+/// exit in time, restore and exit here, so a lost handler cannot leave the
+/// run holding its lock forever.
 pub fn halt_if_interrupted() {
-    if INTERRUPTED.load(Ordering::SeqCst) {
-        loop {
-            std::thread::park();
+    if !INTERRUPTED.load(Ordering::SeqCst) {
+        return;
+    }
+    let until = Instant::now() + HANDLER_GRACE;
+    while let Some(left) = until.checked_duration_since(Instant::now()) {
+        std::thread::park_timeout(left);
+    }
+    restore_and_exit();
+}
+
+const HANDLER_GRACE: Duration = Duration::from_secs(30);
+
+fn restore_and_exit() -> ! {
+    let mut armed = ARMED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(r) = armed.take() {
+        match r.apply() {
+            Ok(_) => log::change("interrupted; restored flake.lock and pins.json"),
+            Err(e) => log::warn(&format!("interrupted; restoring failed: {e:#}")),
         }
     }
+    std::process::exit(130);
 }
 
 static BUILDING: AtomicBool = AtomicBool::new(false);
@@ -160,14 +178,7 @@ pub fn arm(restore: Restore) {
             stop_children();
             // Exit while still holding the lock, so a write the main thread
             // is waiting to make in `critical` never lands after the restore.
-            let mut armed = ARMED.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(r) = armed.take() {
-                match r.apply() {
-                    Ok(_) => log::change("interrupted; restored flake.lock and pins.json"),
-                    Err(e) => log::warn(&format!("interrupted; restoring failed: {e:#}")),
-                }
-            }
-            std::process::exit(130);
+            restore_and_exit();
         });
     });
     if let Ok(mut armed) = ARMED.lock() {
