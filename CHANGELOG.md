@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.8
+
+- A flake input pinned again after a retry kept every target its earlier pin had
+  failed on, including targets that had just built the newer revision. Its
+  `targets` in `pins.json` (and "failed on" in `why` and `status --json`) now drop
+  those, so a revision that fails on one host no longer names others that built it.
+
 ## 0.1.7
 
 - An interrupted run whose terminal had been closed, such as `eppur switch` in a
