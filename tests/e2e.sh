@@ -1663,6 +1663,24 @@ expect_input_pins ""
 git -C "$sys" add -A
 git -C "$sys" commit -qm "extb is fine again"
 
+step "inputs: a pin again after a retry no longer names the targets that built it"
+export_ext "$exta" exta 23 broken
+eppur_ build --update --no-commit || fail "rolling back the broken exta gave up"
+[ "$(input_field exta targets)" = "host a host b" ] || fail "exta should fail on a and b: $(input_field exta targets)"
+git -C "$sys" add -A
+git -C "$sys" commit -qm "exta pinned on a and b"
+export_ext "$exta" exta 24 failb
+eppur_ update || fail "eppur update failed"
+eppur_ build --no-commit || fail "retrying the exta that fails on b gave up"
+expect_log "pinned input exta at "
+[ "$(input_field exta targets)" = "host b" ] || fail "a built the newer exta but the pin still names it: $(input_field exta targets)"
+git -C "$sys" checkout -q -- flake.lock pins.json
+export_ext "$exta" exta 25 ok
+eppur_ build --update --no-commit || fail "the build after exta was fixed gave up"
+expect_input_pins ""
+git -C "$sys" add -A
+git -C "$sys" commit -qm "exta is fine again"
+
 step "inputs: merge takes the later input pins, an emptied map too"
 merge_file="$work/other-pins.json"
 pinned_file() {

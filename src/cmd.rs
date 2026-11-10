@@ -655,6 +655,7 @@ fn run_rolling_back(
                     lock_path,
                     pins_path,
                     &report.rollback,
+                    &report.built.iter().map(|(t, _)| t.to_string()).collect(),
                     date::today(),
                 ) {
                     Ok(applied) => {

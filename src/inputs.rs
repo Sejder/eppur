@@ -161,13 +161,15 @@ pub fn settle(nix: &Nix, lock_path: &Path, pins_path: &Path, deny: &[String]) ->
     Ok(())
 }
 
-/// Take the inputs back in flake.lock and record the pins. Returns one line
+/// Take the inputs back in flake.lock and record the pins. `built` are the
+/// targets that built in the run that found the rollbacks. Returns one line
 /// per input for the run's changes.
 pub fn apply(
     nix: &Nix,
     lock_path: &Path,
     pins_path: &Path,
     rollbacks: &[Rollback],
+    built: &BTreeSet<String>,
     today: i64,
 ) -> Result<Vec<Change>> {
     let wanted: Vec<(String, Value)> = rollbacks
@@ -185,8 +187,7 @@ pub fn apply(
         let failed_nar_hash = existing
             .filter(|p| !p.retrying)
             .map_or_else(|| r.failed_nar_hash.clone(), |p| p.failed_nar_hash.clone());
-        let mut targets: BTreeSet<String> = r.targets.iter().cloned().collect();
-        targets.extend(existing.into_iter().flat_map(|p| p.targets.iter().cloned()));
+        let targets = pin_targets(r, existing, built);
         let pin = InputPin {
             locked: r.locked.clone(),
             failed_nar_hash,
@@ -194,7 +195,7 @@ pub fn apply(
             reason: r.reason,
             failed_drv: r.failed_drv.clone(),
             error: r.error.clone(),
-            targets: targets.into_iter().collect(),
+            targets,
             retrying: false,
         };
         log::change(&format!(
@@ -216,6 +217,22 @@ pub fn apply(
     Ok(changes)
 }
 
+/// The targets a pin records: those the rollback is for, and those of the
+/// pin it replaces, less any of them that just built the newer revision a
+/// retry was testing.
+fn pin_targets(r: &Rollback, existing: Option<&InputPin>, built: &BTreeSet<String>) -> Vec<String> {
+    let mut targets: BTreeSet<String> = r.targets.iter().cloned().collect();
+    if let Some(p) = existing {
+        targets.extend(
+            p.targets
+                .iter()
+                .filter(|t| !(p.retrying && built.contains(*t)))
+                .cloned(),
+        );
+    }
+    targets.into_iter().collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -232,6 +249,39 @@ mod tests {
             targets: vec!["host a".into()],
             retrying: false,
         }
+    }
+
+    fn rollback(targets: &[&str]) -> Rollback {
+        Rollback {
+            input: "atlas".into(),
+            locked: json!({ "narHash": "sha256-good" }),
+            failed_nar_hash: "sha256-newer".into(),
+            reason: Reason::Build,
+            failed_drv: None,
+            error: None,
+            targets: targets.iter().map(|t| t.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn a_repin_after_a_retry_drops_targets_that_built_the_newer_revision() {
+        let mut old = pin();
+        old.targets = vec!["host home".into(), "host pi".into(), "host vps".into()];
+        old.retrying = true;
+        let built = BTreeSet::from(["host home".to_string()]);
+        assert_eq!(
+            pin_targets(&rollback(&["host pi"]), Some(&old), &built),
+            ["host pi", "host vps"]
+        );
+        old.retrying = false;
+        assert_eq!(
+            pin_targets(&rollback(&["host pi"]), Some(&old), &built),
+            ["host home", "host pi", "host vps"]
+        );
+        assert_eq!(
+            pin_targets(&rollback(&["host pi"]), None, &built),
+            ["host pi"]
+        );
     }
 
     #[test]
