@@ -74,6 +74,10 @@ pub fn candidates(
     names
 }
 
+fn announces_retry(pin: &InputPin, building: Option<&[String]>) -> bool {
+    building.is_none_or(|b| pin.targets.is_empty() || pin.targets.iter().any(|t| b.contains(t)))
+}
+
 pub fn denied(input: &str, deny: &[String]) -> bool {
     deny.iter().any(|p| resolve::glob(p, input))
 }
@@ -99,8 +103,16 @@ fn set_lock(nix: &Nix, lock_path: &Path, wanted: &[(String, Value)]) -> Result<(
 /// Bring the lock and the input pins in line after an update: an input that
 /// came back with the revision that failed goes back to its pin, so the lock
 /// stays the same while upstream does, and one with a new revision is marked
-/// to be tried by the next build.
-pub fn settle(nix: &Nix, lock_path: &Path, pins_path: &Path, deny: &[String]) -> Result<()> {
+/// to be tried by the next build. `building` are the targets of the run that
+/// follows, if any: a retry only matters to a run that builds a target the pin
+/// failed on, so it is only announced there.
+pub fn settle(
+    nix: &Nix,
+    lock_path: &Path,
+    pins_path: &Path,
+    deny: &[String],
+    building: Option<&[String]>,
+) -> Result<()> {
     let mut file = PinsFile::load(pins_path)?;
     if file.inputs.is_empty() {
         return Ok(());
@@ -135,7 +147,9 @@ pub fn settle(nix: &Nix, lock_path: &Path, pins_path: &Path, deny: &[String]) ->
             }
             Step::Retry => {
                 pin.retrying = true;
-                log::info(&format!("retrying input {name}"));
+                if announces_retry(pin, building) {
+                    log::info(&format!("retrying input {name}"));
+                }
             }
         }
     }
@@ -282,6 +296,18 @@ mod tests {
             pin_targets(&rollback(&["host pi"]), None, &built),
             ["host pi"]
         );
+    }
+
+    #[test]
+    fn a_retry_is_announced_only_to_a_run_building_a_target_it_failed_on() {
+        let ideapad = ["host ideapad".to_string()];
+        let fleet = ["host ideapad".to_string(), "host a".to_string()];
+        assert!(!announces_retry(&pin(), Some(&ideapad)));
+        assert!(announces_retry(&pin(), Some(&fleet)));
+        assert!(announces_retry(&pin(), None));
+        let mut untargeted = pin();
+        untargeted.targets.clear();
+        assert!(announces_retry(&untargeted, Some(&ideapad)));
     }
 
     #[test]

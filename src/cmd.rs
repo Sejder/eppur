@@ -817,7 +817,14 @@ pub fn reconcile(at: &Where, args: &BuildArgs, how: Activation) -> Result<ExitCo
     if let Some(inputs) = update {
         nix.flake_update(inputs)?;
     }
-    inputs::settle(&nix, &lock_path, &pins_path, &cfg.input_deny)?;
+    let building: Vec<String> = targets.iter().map(|t| t.to_string()).collect();
+    inputs::settle(
+        &nix,
+        &lock_path,
+        &pins_path,
+        &cfg.input_deny,
+        Some(&building),
+    )?;
 
     let host_names = nix.output_names("nixosConfigurations");
     let home_names = nix.output_names("homeConfigurations");
@@ -1038,7 +1045,7 @@ pub fn update(at: &Where) -> Result<ExitCode> {
     });
     let nix = Nix::new(&ctx.flake);
     nix.flake_update(&[])?;
-    inputs::settle(&nix, &lock_path, &pins_path, &deny)?;
+    inputs::settle(&nix, &lock_path, &pins_path, &deny, None)?;
     guard::settle(|| Ok(()))?;
     Ok(ExitCode::SUCCESS)
 }

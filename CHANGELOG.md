@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- A run printed "retrying input NAME" for a pinned flake input even when it
+  built none of the targets the input had failed on, so `eppur switch --update`
+  on one machine announced a retry it could neither test nor clear. The line is
+  now only printed by a run that builds one of those targets, and by `eppur update`.
+
 ## 0.1.8
 
 - A flake input pinned again after a retry kept every target its earlier pin had
