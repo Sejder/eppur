@@ -5,7 +5,7 @@
 //! the whole flake, and moves on again once its new revision builds.
 
 use crate::date;
-use crate::engine::{Change, describe};
+use crate::engine::{Change, describe, describe_dated};
 use crate::lock::Lock;
 use crate::log;
 use crate::nix::Nix;
@@ -74,6 +74,38 @@ pub fn candidates(
     names
 }
 
+/// One line per root input an update moved, added or removed, from the lock
+/// before the update to the lock once settled: an input put straight back
+/// to its pin is not among them.
+pub fn updated(before: &Lock, after: &Lock) -> Vec<String> {
+    let names: BTreeSet<String> = before.inputs().into_iter().chain(after.inputs()).collect();
+    names
+        .into_iter()
+        .filter_map(|name| match (before.locked(&name), after.locked(&name)) {
+            (Some(b), Some(a)) if b["narHash"] != a["narHash"] => Some(format!(
+                "updated input {name}: {} -> {}",
+                describe_dated(&b),
+                describe_dated(&a)
+            )),
+            (None, Some(a)) => Some(format!("added input {name} at {}", describe_dated(&a))),
+            (Some(_), None) => Some(format!("removed input {name}")),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Log what an update changed in the lock.
+pub fn report_update(before: &Lock, lock_path: &Path) -> Result<()> {
+    let lines = updated(before, &Lock::load(lock_path)?);
+    if lines.is_empty() {
+        log::info("no input changed");
+    }
+    for line in lines {
+        log::info(&line);
+    }
+    Ok(())
+}
+
 fn announces_retry(pin: &InputPin, building: Option<&[String]>) -> bool {
     building.is_none_or(|b| pin.targets.is_empty() || pin.targets.iter().any(|t| b.contains(t)))
 }
@@ -139,8 +171,11 @@ pub fn settle(
             Step::Keep => pin.retrying = false,
             Step::Restore => {
                 pin.retrying = false;
+                let failed = lock
+                    .locked(&name)
+                    .map_or_else(|| "?".into(), |l| describe(&l));
                 log::info(&format!(
-                    "input {name} is still at the revision that failed; keeping it at {}",
+                    "input {name}: {failed} is the revision that failed; keeping it at {}",
                     describe(&pin.locked)
                 ));
                 restore.push((name, pin.locked.clone()));
@@ -308,6 +343,26 @@ mod tests {
         let mut untargeted = pin();
         untargeted.targets.clear();
         assert!(announces_retry(&untargeted, Some(&ideapad)));
+    }
+
+    #[test]
+    fn an_update_lists_only_the_inputs_that_moved() {
+        let before = lock("a1", "t1", "n1");
+        assert!(updated(&before, &before).is_empty());
+        let mut json = lock("a1", "t2", "n1").json().clone();
+        json["nodes"]["todo"]["locked"]["rev"] = json!("0123456789abcdef");
+        json["nodes"]["root"]["inputs"]
+            .as_object_mut()
+            .unwrap()
+            .remove("nixpkgs");
+        let after = Lock::from_json(&json).unwrap();
+        assert_eq!(
+            updated(&before, &after),
+            [
+                "removed input nixpkgs",
+                "updated input todo: t1 -> 0123456789ab"
+            ]
+        );
     }
 
     #[test]

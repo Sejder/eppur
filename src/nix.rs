@@ -245,6 +245,18 @@ impl Monitor {
     }
 }
 
+/// What Nix before 2.24 says in place of the error of an attribute whose
+/// evaluation failed before, which leaves nothing to find the culprit in.
+const CACHED_FAILURE: &str = "cached failure of attribute";
+
+fn uncached(cache: bool) -> &'static [&'static str] {
+    if cache {
+        &[]
+    } else {
+        &["--option", "eval-cache", "false"]
+    }
+}
+
 impl Nix {
     pub fn new(flake: &Path) -> Self {
         Self {
@@ -256,19 +268,15 @@ impl Nix {
         format!("{}#{}", self.flake, attr)
     }
 
-    /// Update the lock. Under --quiet its list of updated inputs is kept back
-    /// unless the update fails.
+    /// Update the lock. Its own list of updated inputs is kept back unless
+    /// the update fails: eppur may put some of them straight back, so it lists
+    /// what changed once it has settled the lock.
     pub fn flake_update(&self, inputs: &[String]) -> Result<()> {
-        let quiet = log::is_quiet();
         let mut cmd = command();
         cmd.args(["flake", "update", "--flake", &self.flake])
             .args(inputs)
             .stdin(Stdio::null())
-            .stderr(if quiet {
-                Stdio::piped()
-            } else {
-                Stdio::inherit()
-            });
+            .stderr(Stdio::piped());
         let mut child = spawn(&mut cmd, "nix flake update")?;
         let mut stderr = Vec::new();
         if let Some(mut e) = child.stderr.take() {
@@ -277,9 +285,7 @@ impl Nix {
         let status = child.wait().context("waiting for nix flake update");
         finished(child.id())?;
         if !status?.success() {
-            if quiet {
-                crate::log::raw(&String::from_utf8_lossy(&stderr));
-            }
+            crate::log::raw(&String::from_utf8_lossy(&stderr));
             bail!("nix flake update failed");
         }
         Ok(())
@@ -305,19 +311,30 @@ impl Nix {
         attr: &str,
         input: Option<(&str, &str)>,
     ) -> Result<Result<String, String>> {
-        let mut cmd = command();
-        cmd.args(["eval", "--raw", "--no-write-lock-file"]);
-        if let Some((name, flake_ref)) = input {
-            cmd.args(["--override-input", name, flake_ref]);
-        }
-        cmd.arg(self.installable(&format!("{attr}.drvPath")));
-        let out = run(cmd, "nix eval")?;
-        if out.status.success() {
-            Ok(Ok(String::from_utf8_lossy(&out.stdout).trim().to_string()))
-        } else {
-            Ok(Err(logparse::strip_ansi(&String::from_utf8_lossy(
-                &out.stderr,
-            ))))
+        let attempt = |cache: bool| -> Result<Result<String, String>> {
+            let mut cmd = command();
+            match input {
+                Some((name, flake_ref)) => {
+                    cmd.args(["eval", "--raw", "--no-write-lock-file"])
+                        .args(["--override-input", name, flake_ref])
+                        .arg(self.installable(&format!("{attr}.drvPath")));
+                }
+                None => {
+                    cmd.args(["path-info", "--derivation"])
+                        .args(uncached(cache))
+                        .arg(self.installable(attr));
+                }
+            }
+            let out = run(cmd, "nix path-info")?;
+            Ok(if out.status.success() {
+                Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+            } else {
+                Err(logparse::strip_ansi(&String::from_utf8_lossy(&out.stderr)))
+            })
+        };
+        match attempt(true)? {
+            Err(e) if e.contains(CACHED_FAILURE) => attempt(false),
+            r => Ok(r),
         }
     }
 
@@ -355,17 +372,25 @@ impl Nix {
         }
         let (send, receive) = mpsc::channel();
         let evaluate = |attr: &String, send: &mpsc::Sender<Event>| {
-            let mut cmd = command();
-            cmd.args(["eval", "--raw", "--log-format", "internal-json"])
-                .arg(self.installable(&format!("{attr}.drvPath")));
-            let (status, out, errors) = run_logged(cmd, |line| {
-                let _ = send.send(Event::Line(line.to_vec()));
-            })?;
+            let attempt = |cache: bool| {
+                let mut cmd = command();
+                cmd.args(["path-info", "--derivation", "--log-format", "internal-json"])
+                    .args(uncached(cache))
+                    .arg(self.installable(attr));
+                run_logged(cmd, |line| {
+                    let _ = send.send(Event::Line(line.to_vec()));
+                })
+            };
+            let mut result = attempt(true)?;
+            if result.2.iter().any(|e| e.contains(CACHED_FAILURE)) {
+                result = attempt(false)?;
+            }
+            let (status, out, errors) = result;
             let _ = send.send(Event::Errors(errors.clone()));
             Ok(if status.success() {
                 Ok(String::from_utf8_lossy(&out).trim().to_string())
             } else if errors.is_empty() {
-                Err(vec![format!("nix eval {attr} failed")])
+                Err(vec![format!("nix path-info {attr} failed")])
             } else {
                 Err(errors)
             })

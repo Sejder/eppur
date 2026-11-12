@@ -825,6 +825,9 @@ pub fn reconcile(at: &Where, args: &BuildArgs, how: Activation) -> Result<ExitCo
         &cfg.input_deny,
         Some(&building),
     )?;
+    if update.is_some() {
+        inputs::report_update(&Lock::from_bytes(orig_lock.clone())?, &lock_path)?;
+    }
 
     let host_names = nix.output_names("nixosConfigurations");
     let home_names = nix.output_names("homeConfigurations");
@@ -1035,6 +1038,7 @@ pub fn update(at: &Where) -> Result<ExitCode> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(e).with_context(|| format!("reading {}", pins_path.display())),
     };
+    let before = Lock::from_bytes(lock.clone())?;
     guard::arm(guard::Restore {
         lock_path: lock_path.clone(),
         lock,
@@ -1046,6 +1050,7 @@ pub fn update(at: &Where) -> Result<ExitCode> {
     let nix = Nix::new(&ctx.flake);
     nix.flake_update(&[])?;
     inputs::settle(&nix, &lock_path, &pins_path, &deny, None)?;
+    inputs::report_update(&before, &lock_path)?;
     guard::settle(|| Ok(()))?;
     Ok(ExitCode::SUCCESS)
 }

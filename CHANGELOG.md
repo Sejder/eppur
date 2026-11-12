@@ -6,6 +6,18 @@
   built none of the targets the input had failed on, so `eppur switch --update`
   on one machine announced a retry it could neither test nor clear. The line is
   now only printed by a run that builds one of those targets, and by `eppur update`.
+- Every run evaluated each target in full, even when nothing had changed since
+  the last one, because `nix eval` does not use the flake evaluation cache.
+  Targets are now evaluated with `nix path-info --derivation`, so a run over an
+  unchanged, clean flake skips the evaluation (about a minute for a NixOS host).
+  On Nix before 2.24, which hides the error of a cached failure, a failed
+  evaluation is run again without the cache.
+- While upstream kept a pinned flake input at the revision that failed, every
+  update showed `nix flake update`'s "Updated input" lines for it, although eppur
+  put the input straight back and flake.lock did not change. nix's list is now
+  kept back unless the update fails; eppur lists the root inputs that actually
+  moved once it has settled the lock ("no input changed" when none did), and the
+  line for an input put back names the revision that failed.
 
 ## 0.1.8
 
