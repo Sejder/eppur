@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.1.9
 
 - The rows of `eppur status --json` left out why a host or home was held and
   which targets a pinned flake input failed on, although pins.json records both,
