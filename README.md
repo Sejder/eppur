@@ -475,6 +475,17 @@ across package sets. For scripts, each row also has `target`, `target_kind`
 day an unchanged failure is retried anyway), `error` for an evaluation failure,
 and `sets` with the same per package set; its `label` sums it up, e.g.
 "1d, cloudflared-2026.10.3 failed to build; pinned to 2026.10.3 from nixpkgs-stable".
+A hold's `label` carries the first line of `held_reason`, with store paths
+shortened to their names and cut at 80 characters, e.g. "today, held: its system
+did not build: ...". A flake input's row has `input`, `targets` (the targets it
+failed on), `since`, `cause` (e.g. "aws-lc-5.12.0 failed to build", or
+"evaluation failed: ERROR"), `failed`, `error`, `rev` and `rev_date` (the last
+good revision) and `retrying` (flake.lock has another revision for the next
+build to try); its `label` reads e.g. "3d, aws-lc-5.12.0 failed to build;
+breaks host pi; kept at ff459c63e3bb", with the error cut the same way, and
+"last good REV, flake.lock has another revision to try" in place of "kept at
+REV" while `retrying`. The cause is that of the first target to fail. A label
+gets ", STALE" appended once it is older than warn_after_days.
 Ages are in local days
 and computed when it runs, so regenerate it regularly. The text `status` marks
 the same pins and holds `STALE`.

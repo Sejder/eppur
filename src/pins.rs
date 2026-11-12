@@ -198,7 +198,8 @@ pub struct InputPin {
     /// The targets it failed on, e.g. "host home": a retry only counts as
     /// passed once each of them built.
     pub targets: Vec<String>,
-    /// The lock has a newer revision that a build is testing.
+    /// The lock has a revision other than `locked` for a build to try: a newer
+    /// one, or the failed one when `locked` could not be put back.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub retrying: bool,
 }

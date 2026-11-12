@@ -248,7 +248,7 @@ pub fn apply(
             retrying: false,
         };
         log::change(&format!(
-            "pinned input {} at {}: {}, on {}",
+            "pinned input {} at {}: {}; breaks {}",
             r.input,
             describe(&r.locked),
             crate::summary::input_cause(&pin),

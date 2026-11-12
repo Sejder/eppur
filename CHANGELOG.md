@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- The rows of `eppur status --json` left out why a host or home was held and
+  which targets a pinned flake input failed on, although pins.json records both,
+  so a dashboard showing only `name` and `label` said "today, held" and "...
+  failed to build; kept at REV". A hold's label now carries the first line of its
+  reason with store paths shortened to their names ("today, held: REASON"), and
+  an input pin's label names its targets ("...failed to build; breaks host pi;
+  kept at REV", an evaluation error cut to one line). The `eppur status` table
+  shows those targets in its TARGET column instead of "flake", and no longer
+  breaks on a multi-line evaluation error. An input waiting for a build to try
+  another revision said "kept at REV, retrying" in the label, "retrying" in the
+  table and "the lock has a newer revision" in `eppur why`, although the lock
+  can also hold the revision that failed when the good one is gone upstream; they
+  now say "last good REV, flake.lock has another revision to try".
 - A run printed "retrying input NAME" for a pinned flake input even when it
   built none of the targets the input had failed on, so `eppur switch --update`
   on one machine announced a retry it could neither test nor clear. The line is

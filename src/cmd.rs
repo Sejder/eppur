@@ -1215,16 +1215,25 @@ pub fn status(at: &Where, json: bool) -> Result<ExitCode> {
     let input_pins = file.inputs.len();
     for (input, pin) in &file.inputs {
         rows.push(Row {
-            target: "flake".into(),
+            target: if pin.targets.is_empty() {
+                "flake".into()
+            } else {
+                pin.targets.join(", ")
+            },
             what: format!("input {input}"),
             reason: format!(
                 "{}{}",
-                crate::summary::input_cause(pin),
-                if pin.retrying { ", retrying" } else { "" }
+                crate::summary::input_cause_short(pin),
+                if pin.retrying {
+                    "; flake.lock has another revision to try"
+                } else {
+                    ""
+                }
             ),
             since: format!(
-                "{}  at {}",
+                "{}  {} {}",
                 since(&pin.since, false),
+                if pin.retrying { "last good" } else { "at" },
                 engine::describe(&pin.locked)
             ),
             note: None,
@@ -1281,11 +1290,19 @@ pub fn why(at: &Where, pick: &Pick, attr: &str) -> Result<ExitCode> {
     {
         println!("flake input {attr} is held back in flake.lock, for the whole flake");
         println!("since:     {}", pin.since);
-        println!("kept at:   {}", engine::describe(&pin.locked));
+        println!(
+            "{}{}",
+            if pin.retrying {
+                "last good: "
+            } else {
+                "kept at:   "
+            },
+            engine::describe(&pin.locked)
+        );
         println!("cause:     {}", crate::summary::input_cause(pin));
         println!("failed on: {}", pin.targets.join(", "));
         if pin.retrying {
-            println!("retrying:  the lock has a newer revision");
+            println!("retrying:  the lock has another revision to try");
         } else {
             println!("retried:   once upstream has a new revision");
         }

@@ -1409,6 +1409,10 @@ json_field() { nix eval --raw --impure --expr "let j = builtins.fromJSON (builti
 [ "$(json_field j.input_pins)" = 1 ] || fail "status --json: input_pins is $(json_field j.input_pins)"
 [ "$(json_field j.status)" = PINNED ] || fail "status --json: status is $(json_field j.status)"
 [ "$(json_field '(builtins.head j.items).name')" = "flake input exta" ] || fail "status --json has no row for exta"
+case "$(json_field '(builtins.head j.items).label')" in
+*"; breaks "*"; kept at "*) ;;
+*) fail "status --json label for exta: $(json_field '(builtins.head j.items).label')" ;;
+esac
 eppur_ why exta || fail "eppur why exta failed"
 expect_log "held back in flake.lock"
 expect_log "exta does not compile"
