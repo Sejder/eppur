@@ -534,6 +534,13 @@ pub fn is_built(drv: &str) -> Result<bool> {
     Ok(run(cmd, "nix path-info")?.status.success())
 }
 
+/// Whether `path` is a valid path in the local store.
+pub fn is_valid(path: &str) -> Result<bool> {
+    let mut cmd = command();
+    cmd.args(["path-info", "--offline"]).arg(path);
+    Ok(run(cmd, "nix path-info")?.status.success())
+}
+
 /// The `out` path of a built derivation, read from the drv itself.
 pub fn out_path(drv: &str) -> Result<String> {
     let mut cmd = command();

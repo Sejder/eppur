@@ -1,5 +1,19 @@
 # Changelog
 
+## Unreleased
+
+- A package nixpkgs newly refuses as insecure held the whole host, although
+  the host already ran that same vulnerable copy: the hold did not remove the
+  vulnerability, and it kept every other package old, security fixes included.
+  Such a package is now pinned to the revision the host last built with, as
+  long as this machine already has that copy in its store. A package the
+  configuration only now starts to use still holds the host. The pin is marked
+  `insecure` in `pins.json` (an optional field, so format version 2 is
+  unchanged), "marked insecure upstream" in `eppur status` and `eppur why`, and
+  is warned about on every run. `programs.eppur.pinInsecure = false` keeps the
+  old behaviour of holding the host. Unfree and unsupported packages still
+  hold the host.
+
 ## 0.1.9
 
 - The rows of `eppur status --json` left out why a host or home was held and

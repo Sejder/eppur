@@ -182,6 +182,7 @@ in
           donors
           inputDeny
           retrySameDerivationAfterDays
+          pinInsecure
           ;
         packageSets = builtins.attrNames cfg.nixpkgs;
       };

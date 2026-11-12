@@ -878,6 +878,7 @@ pub fn reconcile(at: &Where, args: &BuildArgs, how: Activation) -> Result<ExitCo
             home_names: home_names.clone(),
             may_roll_back,
             retry_same_after_days: cfg.retry_same_derivation_after_days,
+            pin_insecure: cfg.pin_insecure,
             copies: Default::default(),
             lost: Default::default(),
         })
@@ -1113,8 +1114,9 @@ pub fn merge(at: &Where, other: &Path) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-fn reason_words(reason: Reason) -> &'static str {
-    match reason {
+fn reason_words(pin: &Pin) -> &'static str {
+    match pin.reason {
+        _ if pin.insecure => "is marked insecure upstream; kept at the copy already built",
         Reason::Build => "failed to build",
         Reason::Eval => "failed to evaluate",
         Reason::Manual => "pinned by hand",
@@ -1355,7 +1357,7 @@ pub fn why(at: &Where, pick: &Pick, attr: &str) -> Result<ExitCode> {
         .collect();
     println!("  pinned in: {}", inputs.join(", "));
     for pin in failures {
-        println!("  reason:    {}", reason_words(pin.reason));
+        println!("  reason:    {}", reason_words(pin));
         println!("  since:     {}", pin.since);
         if let Some(tried) = &pin.tried {
             println!("  tried:     {tried}");
@@ -1466,7 +1468,7 @@ pub fn pin(
             if old.reason == Reason::Manual {
                 "pinned by hand".to_string()
             } else {
-                format!("pinned because it {}", reason_words(old.reason))
+                format!("pinned because it {}", reason_words(old))
             },
             old.since
         ));
@@ -1488,6 +1490,7 @@ pub fn pin(
             donor: None,
             leaf: false,
             version: None,
+            insecure: false,
         },
     );
     file.save(&pins_path)?;

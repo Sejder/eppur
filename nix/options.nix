@@ -102,6 +102,11 @@ in
     default = 7;
     description = "When an input moves but a pinned package's derivation is still the one that failed, retry it only once it was last tried this many days ago; 0 retries it whenever its input moves.";
   };
+  pinInsecure = mkOption {
+    type = types.bool;
+    default = true;
+    description = "When nixpkgs starts refusing a package as insecure, pin it to the copy this machine already built, so the rest of the host still updates; the pin is marked insecure in status and warned about on every run. false holds the host instead, as nixpkgs' refusal intends, until the package is fixed, removed, or allowed with nixpkgs.config.permittedInsecurePackages.";
+  };
   switcher = mkOption {
     type = types.enum [
       "nh"

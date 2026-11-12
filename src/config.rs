@@ -49,6 +49,14 @@ pub struct Config {
     /// last tried this many days ago; 0 retries it whenever its input moves.
     #[serde(default = "default_retry_same_after_days")]
     pub retry_same_derivation_after_days: i64,
+    /// Pin a package nixpkgs now refuses as insecure to the copy this machine
+    /// already built, instead of holding the host.
+    #[serde(default = "default_true")]
+    pub pin_insecure: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_switcher() -> String {

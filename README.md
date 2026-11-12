@@ -163,8 +163,8 @@ released as one package. `status` shows the sets next to it.
 a configuration that no longer evaluates, such as a removed NixOS option, a
 denylisted core package such as the kernel, glibc, systemd, nix, stdenv or
 gcc, a package too much depends on, a package that fails at the old revision
-too, or a package nixpkgs refuses to evaluate because it became insecure,
-unfree or unsupported), the host is held: eppur records the lock it last
+too, or a package nixpkgs refuses to evaluate because it became unfree or
+unsupported), the host is held: eppur records the lock it last
 built with in its entry and does not build it on the new one. The shared
 `flake.lock` still moves for the other hosts, so a held machine only stays on
 its old system if whatever updates it checks `held` (see [A fleet](#a-fleet));
@@ -175,6 +175,32 @@ machine
 eppur runs on is never held unless you pass `--hold-local`: eppur gives up
 on it instead, for `build`, `switch`, `boot` and the timer alike. It restores
 `flake.lock` and `pins.json`, commits nothing and activates nothing.
+
+**Insecure.** nixpkgs refuses to evaluate a package marked insecure until you
+allow it in `nixpkgs.config.permittedInsecurePackages`. That refusal is an
+alarm: something on the system has a known vulnerability, and someone should
+replace it, remove it, or decide to accept it. When a package starts being
+refused after an update, the host already runs the vulnerable copy, and
+holding the host would keep that copy and every other package old, security
+fixes included. So by default eppur pins the package (or, for a nested one
+such as `python3Packages.python-jose`, the top-level package that uses it)
+to the revision the host last built with, and lets the rest of the system
+move on. This only reduces how far the system lags behind. It does not fix the
+vulnerability, and it silences nixpkgs' alarm, so eppur keeps raising it:
+
+- the pin is marked `insecure` in `pins.json`, and `eppur status` and
+  `eppur why` say "marked insecure upstream";
+- every run logs a warning for each such pin until it is gone;
+- it ages like any other pin, so `warnAfterDays` reports it as stale.
+
+A pin is only made to a copy that is already in this machine's store, built
+for a system that ran before. A package the configuration only now starts to
+use, or one whose copy is gone from the store, is not pinned; the host is held,
+as nixpkgs intends. The pin is retried like any other when its input moves, and
+is gone once nixpkgs ships a fixed version or drops the marking. To keep the
+alarm loud instead, set `programs.eppur.pinInsecure = false`: the host is then
+held until the package is fixed, removed, or allowed. Allowing it with
+`permittedInsecurePackages` takes the new revision's copy and needs no pin.
 
 **Infrastructure.** A build that cannot run on this machine at all (another
 platform, no builder, a timeout, out of memory, a build killed by a signal) is
@@ -337,7 +363,7 @@ required, the rest default as the module options do):
 { "kind": "nixos", "self": "laptop", "flake": "/home/alice/nixos",
   "hosts": ["laptop"], "homes": [], "input": "nixpkgs", "warnAfterDays": 14,
   "deny": [], "quiet": false, "commit": false, "switcher": "nh",
-  "donors": [], "retrySameDerivationAfterDays": 7 }
+  "donors": [], "retrySameDerivationAfterDays": 7, "pinInsecure": true }
 ```
 
 ## Options
@@ -362,6 +388,7 @@ required, the rest default as the module options do):
 | `donors` | `[ ]` | flake inputs a failed package may be pinned to when one has a newer, already built copy of it (see [Donor](#concepts)) |
 | `inputDeny` | `[ ]` | flake inputs never to roll back in `flake.lock` when they break a build; a trailing `*` matches a prefix, so `[ "*" ]` turns rolling back off (see [Flake input](#concepts)) |
 | `retrySameDerivationAfterDays` | `7` | retry a build failure whose derivation an update did not change only after this many days; `0` on every move of its input |
+| `pinInsecure` | `true` | pin a package nixpkgs newly refuses as insecure to the copy this machine already built, instead of holding the host; `false` holds it (see [Insecure](#concepts)) |
 | `package` | this flake's | the eppur package |
 | `nixpkgs.<input>` | `{ }` | another nixpkgs to import with pins applied: `source`, `config` (default: this host's `nixpkgs.config`), `argName` |
 | `packageSets` | read-only | every package set eppur pins on this machine, keyed by input |
@@ -567,7 +594,8 @@ host server  -                                       whole host held  2026-10-01
 ```
 
 `locked` is the flake.lock node of the nixpkgs the package is taken from, so
-the overlay fetches it purely. A run replaces the entries of the targets it
+the overlay fetches it purely. A pin made because nixpkgs refuses the package
+as insecure has `"reason": "eval"` and `"insecure": true`. A run replaces the entries of the targets it
 built and leaves the others alone. `eppur merge` combines two files: per
 target, an entry made for the flake's current `flake.lock` wins over one that was
 not, then the entry from the newer lock (a held entry counts the lock it was

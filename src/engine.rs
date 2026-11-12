@@ -68,6 +68,9 @@ pub struct Engine {
     /// off once a rollback in this run did not help.
     pub may_roll_back: bool,
     pub retry_same_after_days: i64,
+    /// Whether a package nixpkgs now refuses as insecure may be pinned to the
+    /// copy this machine already built; otherwise its targets are held.
+    pub pin_insecure: bool,
     /// Evaluated copies of packages, by target, attr, revision and overlays.
     pub copies: std::cell::RefCell<HashMap<String, Option<Copy>>>,
     /// Whether a package set lost an attr between two revisions, by old
@@ -166,6 +169,9 @@ struct Wanted {
     cause: String,
     trail: Vec<String>,
     error: Option<String>,
+    /// nixpkgs refuses it as insecure: only a copy this machine already
+    /// built may be pinned.
+    insecure: bool,
 }
 
 /// A failure no pin can help with, which a flake input may have caused.
@@ -698,6 +704,12 @@ impl Engine {
         let base = original.entry(target.kind, &target.name).cloned();
         let mut entry = base.clone().unwrap_or_default();
         let held_before = entry.held.take();
+        for (input, attr, pin) in entry.iter().filter(|(_, _, p)| p.insecure) {
+            log::warn(&format!(
+                "{target}: {attr} ({input}) is kept at {}, which nixpkgs now marks insecure",
+                describe_dated(&pin.locked)
+            ));
+        }
         let held_lock = held_before
             .as_ref()
             .map(|h| Lock::from_json(&h.lock))
@@ -1189,15 +1201,17 @@ impl Engine {
             let parsed = logparse::parse(&msgs);
             if let Some((attr, reason)) = parsed.iter().find_map(|f| match f {
                 Failure::Refused { attr, reason } => Some((attr, reason)),
+                Failure::Insecure { attr, reason } if !self.pin_insecure => Some((attr, reason)),
                 _ => None,
             }) {
                 st.status = Status::Failed(format!("nixpkgs refuses {attr} because {reason}"));
                 continue;
             }
-            let attrs: Vec<String> = parsed
+            let attrs: Vec<(String, bool)> = parsed
                 .into_iter()
                 .filter_map(|f| match f {
-                    Failure::Eval { attr } => Some(attr),
+                    Failure::Eval { attr } => Some((attr, false)),
+                    Failure::Insecure { attr, .. } => Some((attr, true)),
                     _ => None,
                 })
                 .collect();
@@ -1215,7 +1229,7 @@ impl Engine {
             let error = msgs.first().map(|m| logparse::headline(m));
             let mut context: Option<Vec<String>> = None;
             let mut wanted = Vec::new();
-            for attr in attrs {
+            for (attr, insecure) in attrs {
                 let inputs = self.eval_input(st, &attr)?;
                 let mut found = (!inputs.is_empty()).then(|| (inputs, attr.clone()));
                 if found.is_none() {
@@ -1248,16 +1262,27 @@ impl Engine {
                     }
                 }
                 match found {
-                    Some((inputs, attr)) => wanted.push(Wanted {
-                        members: inputs.into_iter().map(|i| (i, attr.clone())).collect(),
+                    Some((inputs, outer)) => wanted.push(Wanted {
+                        members: inputs.into_iter().map(|i| (i, outer.clone())).collect(),
                         reason: Reason::Eval,
                         failed_drv: None,
                         root_drv: None,
                         leaf: false,
-                        cause: format!("evaluation failed: {}", error.clone().unwrap_or_default()),
+                        cause: if insecure {
+                            format!("nixpkgs now marks {attr} as insecure")
+                        } else {
+                            format!("evaluation failed: {}", error.clone().unwrap_or_default())
+                        },
                         trail: Vec::new(),
                         error: error.clone(),
+                        insecure,
                     }),
+                    None if insecure => {
+                        st.status = Status::Failed(format!(
+                            "nixpkgs refuses {attr} because it is marked as insecure, and no older nixpkgs that built has it"
+                        ));
+                        break;
+                    }
                     None => {
                         st.unpinnable.replace(Some(Unpinnable {
                             failed_drv: None,
@@ -1376,6 +1401,7 @@ impl Engine {
                         cause: format!("{} failed to build", graph.display_name(drv)),
                         trail: graph.trail(drv, root, closure),
                         error: None,
+                        insecure: false,
                     });
                 }
             }
@@ -1549,6 +1575,7 @@ impl Engine {
                         pin.trail = w.trail.clone();
                         pin.error = w.error.clone();
                     }
+                    pin.insecure = w.insecure;
                     if w.root_drv.is_some() {
                         pin.root_drv = w.root_drv.clone();
                         pin.leaf = w.leaf;
@@ -1578,6 +1605,7 @@ impl Engine {
                     pin.root_drv = w.root_drv.clone();
                     pin.leaf = w.leaf;
                     pin.tried = None;
+                    pin.insecure = w.insecure;
                     let pin = self.with_donor(st, input, attr, pin, false);
                     let pin = self.versioned(st, attr, pin);
                     added.push((input.clone(), attr.clone(), pin));
@@ -1601,6 +1629,22 @@ impl Engine {
                     continue;
                 }
                 let overlays = choose_overlays(&self.nix, &st.target, input, attr, &locked);
+                if w.insecure
+                    && !{
+                        let system = self.system_of(st).to_string();
+                        pinned_copy_built(&self.nix, &st.target, &system, attr, &locked, overlays)
+                    }
+                {
+                    skipped.push((
+                        attr.clone(),
+                        input.clone(),
+                        format!(
+                            "nixpkgs marks it insecure, and this machine has not built its copy at {}, so pinning it would install it rather than keep it",
+                            describe_dated(&locked)
+                        ),
+                    ));
+                    continue;
+                }
                 let pin = Pin {
                     locked,
                     since: date::format(self.today),
@@ -1615,6 +1659,7 @@ impl Engine {
                     donor: None,
                     leaf: w.leaf,
                     version: None,
+                    insecure: w.insecure,
                 };
                 let pin = self.with_donor(st, input, attr, pin, false);
                 let pin = self.versioned(st, attr, pin);
@@ -2258,6 +2303,44 @@ pub fn choose_overlays(
             _ => Some(false),
         },
     }
+}
+
+/// Whether the copy of `attr` a pin to `locked` provides, with or without the
+/// machine's overlays as chosen, is already in this machine's store. A target
+/// without importPinned gets the package set imported plainly.
+fn pinned_copy_built(
+    nix: &Nix,
+    target: &Target,
+    system: &str,
+    attr: &str,
+    locked: &serde_json::Value,
+    overlays: Option<bool>,
+) -> bool {
+    let Ok(literal) = crate::nix::nix_json(locked) else {
+        return false;
+    };
+    if !resolve::is_attr_name(attr) {
+        return false;
+    }
+    let out = nix.eval_apply(
+        &target.eppur_config(),
+        &format!(
+            "c: if !(c ? importPinned) then null else (c.importPinned {{ locked = {literal}; overlays = {}; }}).{attr}.outPath",
+            overlays.unwrap_or(false)
+        ),
+    );
+    let path = match out {
+        Ok(serde_json::Value::String(path)) => path,
+        Ok(serde_json::Value::Null) => match resolve::copy_at(locked, system, attr) {
+            Ok(Some(copy)) => match copy["out"].as_str() {
+                Some(out) => out.to_string(),
+                None => return false,
+            },
+            _ => return false,
+        },
+        _ => return false,
+    };
+    crate::nix::is_valid(&path).unwrap_or(false)
 }
 
 /// "1 package", "2 packages".

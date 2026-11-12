@@ -78,6 +78,10 @@ pub struct Pin {
     /// The version of the package the pin provides, for status.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
+    /// Whether nixpkgs refuses the package as insecure: the pin keeps the
+    /// vulnerable copy this machine already built, instead of holding the host.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub insecure: bool,
 }
 
 impl Pin {
@@ -453,6 +457,7 @@ mod tests {
             donor: None,
             leaf: false,
             version: None,
+            insecure: false,
         }
     }
 

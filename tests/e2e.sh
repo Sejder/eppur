@@ -684,14 +684,36 @@ git -C "$sys" checkout -q -- flake.lock pins.json
 revision fixed false 12 ok
 eppur_ build --update || fail "eppur build gave up after the module error"
 
-step "an insecure package is not pinned around"
+step "an insecure package already built is kept at that copy, unless pinInsecure is off"
 revision fixed false insecure ok
+write_config "" '"pinInsecure": false'
 cp "$sys/flake.lock" "$work/before.lock"
-if eppur_ build --update; then fail "an insecure hello on the local host should give up"; fi
+if eppur_ build --update; then fail "with pinInsecure off, an insecure hello on the local host should give up"; fi
 expect_log "nixpkgs refuses hello because it is marked as insecure"
 reject_log "pinned host a"
 cmp -s "$sys/flake.lock" "$work/before.lock" || fail "flake.lock was not restored"
+write_config ""
+eppur_ build --update || fail "an insecure hello built before should be pinned, not give up"
+expect_log "nixpkgs now marks hello as insecure"
+[ "$(field a toypkgs hello insecure)" = "1" ] || fail "the hello pin on a is not marked insecure"
+expect_built a hello-12
+eppur_ status || fail "eppur status failed"
+expect_log "marked insecure upstream"
 revision fixed false 13 ok
+eppur_ build --update || fail "eppur build gave up after the insecure revision"
+expect_pins a ""
+
+step "an insecure package this machine never built is not pinned around"
+hello13="$(nix build --no-link --print-out-paths --impure --expr "(import $toy { system = \"$system\"; }).hello")"
+# shellcheck disable=SC2046
+nix store delete $(nix-store -q --referrers-closure "$hello13") >/dev/null 2>&1 || fail "could not delete $hello13"
+revision fixed false insecure ok
+cp "$sys/flake.lock" "$work/before.lock"
+if eppur_ build --update; then fail "an insecure hello never built on the local host should give up"; fi
+expect_log "this machine has not built its copy"
+reject_log "pinned host a"
+cmp -s "$sys/flake.lock" "$work/before.lock" || fail "flake.lock was not restored"
+revision fixed false 13b ok
 eppur_ build --update || fail "eppur build gave up after the insecure revision"
 
 step "--max-new-pins: a host needing too many new pins is held"

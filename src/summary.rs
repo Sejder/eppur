@@ -42,6 +42,7 @@ pub fn age_text(days: Option<i64>) -> String {
 /// What made eppur pin it, e.g. "cloudflared-2026.10.3 failed to build".
 pub fn cause(pin: &Pin) -> String {
     match pin.reason {
+        _ if pin.insecure => "marked insecure upstream".into(),
         Reason::Build => match &pin.failed_drv {
             Some(drv) => format!("{} failed to build", drv_name(drv)),
             None => "failed to build".into(),
@@ -350,7 +351,16 @@ mod tests {
             donor: None,
             leaf: false,
             version: None,
+            insecure: false,
         }
+    }
+
+    #[test]
+    fn insecure_pin_says_so() {
+        let mut p = pin("2026-11-12");
+        assert_eq!(cause(&p), "evaluation failed");
+        p.insecure = true;
+        assert_eq!(cause(&p), "marked insecure upstream");
     }
 
     fn today() -> i64 {

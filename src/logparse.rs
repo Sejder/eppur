@@ -13,9 +13,13 @@ pub enum Failure {
     /// broken. Pinning it to the last good nixpkgs can fix that.
     Eval { attr: String },
     /// An attribute nixpkgs refuses for a reason that is a decision, not a
-    /// breakage: marked insecure, unfree, or unsupported. Pinning around that
-    /// would bypass nixpkgs' guard or the user's own settings.
+    /// breakage: unfree or unsupported. Pinning around that would bypass the
+    /// user's own settings.
     Refused { attr: String, reason: String },
+    /// An attribute nixpkgs now refuses as insecure. The revision the host
+    /// last built with has the same vulnerable package, so it may be pinned
+    /// there, as long as this machine has built that copy before.
+    Insecure { attr: String, reason: String },
 }
 
 static ANSI: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\x1b\[[0-9;]*[A-Za-z]").unwrap());
@@ -172,6 +176,13 @@ fn refusal_is_breakage(why: &str) -> bool {
         && !why.contains("unsupported")
 }
 
+/// Whether a refusal is for being marked insecure and nothing that is the
+/// user's own setting.
+fn refusal_is_insecure(why: &str) -> bool {
+    let why = why.to_lowercase();
+    why.contains("insecure") && !why.contains("unfree") && !why.contains("unsupported")
+}
+
 fn is_dependency_failure(reason: &str) -> bool {
     reason.contains("dependency failed") || reason.contains("dependencies failed")
 }
@@ -253,7 +264,11 @@ pub fn parse(messages: &[String]) -> Vec<Failure> {
                     .trim()
                     .trim_end_matches(':')
                     .to_string();
-                push(Failure::Refused { attr, reason });
+                if refusal_is_insecure(&why) {
+                    push(Failure::Insecure { attr, reason });
+                } else {
+                    push(Failure::Refused { attr, reason });
+                }
             }
         } else if let Some(c) = REMOVED.captures(&msg) {
             push(Failure::Eval {
@@ -440,9 +455,30 @@ mod tests {
                     attr: "cuda-merged".into(),
                     reason: "it has an unfree license (\u{2018}CUDA EULA\u{2019})".into()
                 },
-                Failure::Refused {
+                Failure::Insecure {
                     attr: "hello".into(),
                     reason: "it is marked as insecure".into()
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn eval_refused_insecure_alone_is_pinnable() {
+        let msgs = vec![
+            "error: Refusing to evaluate package 'python3.14-python-jose-3.5.0' in /nix/store/x-source/pkgs/development/python-modules/python-jose/default.nix:80 because it is marked as insecure\n\nKnown issues:\n - CVE-2024-33663".to_string(),
+            "error: Refusing to evaluate package 'hello-2.12.3' in /nix/store/x-source/pkgs/by-name/he/hello/package.nix:16 because it has problems:\n- insecure: CVE-1\n- unsupported: not on this platform".to_string(),
+        ];
+        assert_eq!(
+            parse(&msgs),
+            vec![
+                Failure::Insecure {
+                    attr: "python3.14-python-jose".into(),
+                    reason: "it is marked as insecure".into()
+                },
+                Failure::Refused {
+                    attr: "hello".into(),
+                    reason: "it has problems".into()
                 },
             ]
         );
