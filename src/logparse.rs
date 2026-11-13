@@ -1,5 +1,4 @@
 use regex::Regex;
-use serde_json::Value;
 use std::sync::LazyLock;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,7 +46,6 @@ static BY_NAME: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"/pkgs/by-name/[^/]+/([^/]+)/package\.nix$").unwrap());
 static REMOVED: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"'([^']+)' has been (?:removed|renamed|replaced)").unwrap());
-static VERSION: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^(.+?)-[0-9]").unwrap());
 static TRACE_OPTION: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r#"while evaluating the option `(?:systemd\.(?:user\.)?)?services\."?([A-Za-z0-9_+-]+)"?"#,
@@ -58,14 +56,20 @@ static TRACE_DRV: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"while evaluating derivation '([^']+)'").unwrap());
 
 pub fn strip_ansi(s: &str) -> String {
+    if !s.as_bytes().contains(&0x1b) {
+        return s.to_string();
+    }
     ANSI.replace_all(s, "").into_owned()
 }
 
 pub fn strip_version(name: &str) -> &str {
-    VERSION
-        .captures(name)
-        .and_then(|c| c.get(1))
-        .map_or(name, |m| m.as_str())
+    let b = name.as_bytes();
+    for i in 1..b.len().saturating_sub(1) {
+        if b[i] == b'-' && b[i + 1].is_ascii_digit() {
+            return &name[..i];
+        }
+    }
+    name
 }
 
 /// The line of a nix error that says what went wrong. Messages open with a
@@ -130,33 +134,63 @@ pub fn eval_context(messages: &[String]) -> Vec<String> {
     out
 }
 
-/// The "building '...'" and "copying path '...'" lines nix prints for its
-/// builds and substitutions, from internal-json activity starts.
-pub fn activity_text(line: &str) -> Option<String> {
-    let json: Value = serde_json::from_str(line.strip_prefix("@nix ")?).ok()?;
-    if json["action"] != "start" || !matches!(json["type"].as_u64(), Some(100) | Some(105)) {
-        return None;
-    }
-    json["text"]
-        .as_str()
-        .filter(|t| !t.is_empty())
-        .map(strip_ansi)
+#[derive(serde::Deserialize)]
+struct NixLine<'a> {
+    #[serde(borrow)]
+    action: Option<&'a str>,
+    #[serde(rename = "type")]
+    kind: Option<u64>,
+    level: Option<u64>,
+    #[serde(borrow)]
+    text: Option<std::borrow::Cow<'a, str>>,
+    #[serde(borrow)]
+    msg: Option<std::borrow::Cow<'a, str>>,
 }
 
-/// Whether a line of a nix command's internal-json stderr is an "error
-/// (ignored)": nix carried on without it, as when commands running side by side
-/// find its evaluation cache busy. Not a failure, and not worth showing.
-pub fn is_ignored_error(line: &str) -> bool {
-    error_message(line).is_some_and(|m| m.trim_start().starts_with("error (ignored)"))
+/// What a line of a nix command's `--log-format internal-json` stderr says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NixLogEvent {
+    /// An "error (ignored)": nix carried on without it, as when commands
+    /// running side by side find its evaluation cache busy. Not a failure, and
+    /// not worth showing.
+    IgnoredError,
+    /// The text of an error-level message.
+    Error(String),
+    /// The "building '...'" and "copying path '...'" lines nix prints for its
+    /// builds and substitutions.
+    Activity(String),
+    Other,
 }
 
-/// The text of an error-level message from a `--log-format internal-json` stderr line.
-pub fn error_message(line: &str) -> Option<String> {
-    let json: Value = serde_json::from_str(line.strip_prefix("@nix ")?).ok()?;
-    if json["action"] != "msg" || json["level"] != 0 {
-        return None;
+pub fn parse_nix_line(line: &str) -> NixLogEvent {
+    let Some(rest) = line.strip_prefix("@nix ") else {
+        return NixLogEvent::Other;
+    };
+    let Ok(parsed) = serde_json::from_str::<NixLine<'_>>(rest) else {
+        return NixLogEvent::Other;
+    };
+    match parsed.action {
+        Some("msg") if parsed.level == Some(0) => {
+            if let Some(msg) = parsed.msg {
+                let clean = strip_ansi(&msg);
+                if clean.trim_start().starts_with("error (ignored)") {
+                    NixLogEvent::IgnoredError
+                } else {
+                    NixLogEvent::Error(clean)
+                }
+            } else {
+                NixLogEvent::Other
+            }
+        }
+        Some("start") if matches!(parsed.kind, Some(100) | Some(105)) => {
+            if let Some(text) = parsed.text.filter(|t| !t.is_empty()) {
+                NixLogEvent::Activity(strip_ansi(&text))
+            } else {
+                NixLogEvent::Other
+            }
+        }
+        _ => NixLogEvent::Other,
     }
-    json["msg"].as_str().map(strip_ansi)
 }
 
 /// Whether a "Cannot build" reason means the build ran and failed, as opposed
@@ -307,6 +341,24 @@ pub fn failed_drvs(messages: &[String]) -> std::collections::HashSet<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn activity_text(line: &str) -> Option<String> {
+        match parse_nix_line(line) {
+            NixLogEvent::Activity(text) => Some(text),
+            _ => None,
+        }
+    }
+
+    fn is_ignored_error(line: &str) -> bool {
+        parse_nix_line(line) == NixLogEvent::IgnoredError
+    }
+
+    fn error_message(line: &str) -> Option<String> {
+        match parse_nix_line(line) {
+            NixLogEvent::Error(msg) => Some(msg),
+            _ => None,
+        }
+    }
 
     #[test]
     fn ignored_errors_are_told_apart() {

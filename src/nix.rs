@@ -77,7 +77,7 @@ fn run(mut cmd: Command, what: &str) -> Result<Output> {
 /// stderr to `on_line`, and collect its stdout and error messages.
 fn run_logged(
     mut cmd: Command,
-    mut on_line: impl FnMut(&[u8]),
+    mut on_line: impl FnMut(&[u8], &logparse::NixLogEvent),
 ) -> Result<(ExitStatus, Vec<u8>, Vec<String>)> {
     let mut child = spawn(
         cmd.stdin(Stdio::null())
@@ -99,13 +99,15 @@ fn run_logged(
         if reader.read_until(b'\n', &mut buf)? == 0 {
             break;
         }
-        let line = String::from_utf8_lossy(&buf);
-        let line = line.trim_end();
-        if logparse::is_ignored_error(line) {
+        let event = {
+            let line = String::from_utf8_lossy(&buf);
+            logparse::parse_nix_line(line.trim_end())
+        };
+        if matches!(event, logparse::NixLogEvent::IgnoredError) {
             continue;
         }
-        on_line(&buf);
-        if let Some(msg) = logparse::error_message(line) {
+        on_line(&buf, &event);
+        if let logparse::NixLogEvent::Error(msg) = event {
             errors.push(msg);
         }
     }
@@ -214,12 +216,12 @@ impl Monitor {
     /// Run `cmd` with internal-json logging, feeding its stderr to nom and
     /// collecting its error messages and stdout.
     fn run(&mut self, cmd: Command) -> Result<(ExitStatus, Vec<u8>, Vec<String>)> {
-        run_logged(cmd, |line| self.line(line, true))
+        run_logged(cmd, |line, event| self.line(line, event, true))
     }
 
     /// A line of a nix command's stderr: for nom on a terminal, else its
     /// progress and, when `errors`, its error messages go to stderr.
-    fn line(&mut self, line: &[u8], errors: bool) {
+    fn line(&mut self, line: &[u8], event: &logparse::NixLogEvent, errors: bool) {
         if let Some(pipe) = &mut self.pipe
             && pipe.write_all(line).is_err()
         {
@@ -228,12 +230,10 @@ impl Monitor {
         if self.active() {
             return;
         }
-        let text = String::from_utf8_lossy(line);
-        if let Some(progress) = logparse::activity_text(text.trim_end()) {
-            log::nix_progress(&progress);
-        }
-        if errors && let Some(msg) = logparse::error_message(text.trim_end()) {
-            log::nix_error(&msg);
+        match event {
+            logparse::NixLogEvent::Activity(progress) => log::nix_progress(progress),
+            logparse::NixLogEvent::Error(msg) if errors => log::nix_error(msg),
+            _ => {}
         }
     }
 
@@ -367,7 +367,7 @@ impl Nix {
         monitor: &mut Monitor,
     ) -> Result<Vec<Result<String, Vec<String>>>> {
         enum Event {
-            Line(Vec<u8>),
+            Line(Vec<u8>, logparse::NixLogEvent),
             Errors(Vec<String>),
         }
         let (send, receive) = mpsc::channel();
@@ -377,8 +377,8 @@ impl Nix {
                 cmd.args(["path-info", "--derivation", "--log-format", "internal-json"])
                     .args(uncached(cache))
                     .arg(self.installable(attr));
-                run_logged(cmd, |line| {
-                    let _ = send.send(Event::Line(line.to_vec()));
+                run_logged(cmd, |line, event| {
+                    let _ = send.send(Event::Line(line.to_vec(), event.clone()));
                 })
             };
             let mut result = attempt(true)?;
@@ -403,7 +403,7 @@ impl Nix {
             });
             for event in receive {
                 match event {
-                    Event::Line(line) => monitor.line(&line, false),
+                    Event::Line(line, parsed) => monitor.line(&line, &parsed, false),
                     Event::Errors(errors) if !monitor.active() => {
                         for msg in &errors {
                             log::nix_error(msg);
