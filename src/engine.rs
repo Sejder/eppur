@@ -1983,6 +1983,7 @@ impl Engine {
         report: &mut Report,
     ) -> Result<()> {
         let mut stale: Vec<&Target> = Vec::new();
+        let mut check_drvs: Vec<(&Target, &str, &str)> = Vec::new();
         for (target, bytes, source) in done_with {
             if bytes.as_slice() == final_bytes {
                 continue;
@@ -1991,23 +1992,32 @@ impl Engine {
                 .built
                 .iter()
                 .find(|(t, _)| t == target)
-                .map(|(_, d)| d)
+                .map(|(_, d)| d.as_str())
             else {
                 continue;
             };
             // Only a system that takes the flake's source tree as a source can
             // depend on what other targets' entries say.
-            let embeds = match source {
-                Some(src) => self
-                    .nix
-                    .show_drvs(std::slice::from_ref(drv))?
-                    .nodes
-                    .values()
-                    .any(|n| n.srcs.iter().any(|p| p == src || p.ends_with("-pins.json"))),
-                None => true,
-            };
-            if embeds {
-                stale.push(target);
+            match source.as_deref() {
+                Some(src) => check_drvs.push((target, drv, src)),
+                None => stale.push(target),
+            }
+        }
+        if !check_drvs.is_empty() {
+            let drvs: Vec<String> = check_drvs
+                .iter()
+                .map(|(_, d, _)| (*d).to_string())
+                .collect();
+            let graph = self.nix.show_drvs(&drvs)?;
+            for (target, drv, src) in check_drvs {
+                let embeds = graph.closure(drv).iter().any(|d| {
+                    graph.nodes.get(d).is_some_and(|n| {
+                        n.srcs.iter().any(|p| p == src || p.ends_with("-pins.json"))
+                    })
+                });
+                if embeds {
+                    stale.push(target);
+                }
             }
         }
         if stale.is_empty() {
