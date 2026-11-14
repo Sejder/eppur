@@ -33,6 +33,8 @@ static OLD_TIMEOUT: LazyLock<Regex> = LazyLock::new(|| {
 static OLD_DEPENDENTS: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"dependenc(?:y|ies) of derivation '(/[^']+\.drv)' failed to build").unwrap()
 });
+static OLD_PLATFORM: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"is required to build '(/[^']+\.drv)', but I am").unwrap());
 static HASH_MISMATCH: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"hash mismatch in fixed-output derivation '(/[^']+\.drv)'").unwrap()
 });
@@ -289,6 +291,13 @@ pub fn parse(messages: &[String]) -> Vec<Failure> {
                 reason: "timed out".into(),
             });
         }
+        for c in OLD_PLATFORM.captures_iter(&msg) {
+            found_build = true;
+            push(Failure::Infra {
+                drv: c[1].to_string(),
+                reason: "platform mismatch".into(),
+            });
+        }
         if OLD_DEPENDENTS.is_match(&msg) {
             found_build = true;
         }
@@ -343,6 +352,7 @@ pub fn failed_drvs(messages: &[String]) -> std::collections::HashSet<String> {
             &*HASH_MISMATCH,
             &*OLD_TIMEOUT,
             &*OLD_DEPENDENTS,
+            &*OLD_PLATFORM,
         ] {
             for c in re.captures_iter(&msg) {
                 out.insert(c[1].to_string());
@@ -414,6 +424,24 @@ mod tests {
         let all = failed_drvs(&msgs);
         assert!(all.iter().any(|d| d.ends_with("-fetched-1.0.drv")));
         assert!(all.iter().any(|d| d.ends_with("-app-1.0.drv")));
+    }
+
+    #[test]
+    fn platform_mismatch_of_older_nix_is_infrastructure() {
+        let msgs = vec![
+            "error: a 'aarch64-darwin' with features {} is required to build '/nix/store/2r69qc44vvv2bcd26zabid4cwn51aa2m-hello-foreign.drv', but I am a 'x86_64-linux' with features {benchmark, big-parallel, kvm, nixos-test, uid-range}".to_string(),
+        ];
+        assert_eq!(
+            parse(&msgs),
+            vec![Failure::Infra {
+                drv: "/nix/store/2r69qc44vvv2bcd26zabid4cwn51aa2m-hello-foreign.drv".into(),
+                reason: "platform mismatch".into(),
+            }]
+        );
+        assert!(
+            failed_drvs(&msgs)
+                .contains("/nix/store/2r69qc44vvv2bcd26zabid4cwn51aa2m-hello-foreign.drv")
+        );
     }
 
     #[test]

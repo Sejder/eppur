@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- On older Nix (2.19.4 and 2.24.14 at least), a build for another platform is reported as "a
+  'SYSTEM' with features {} is required to build 'DRV', but I am a ...",
+  which eppur did not read: the run stopped with "the build failed without
+  naming a derivation" instead of holding the hosts that need it. It is now
+  read as a build that cannot run on this machine. Found by the new CI job
+  on Nix 2.19.4 and 2.24.14.
+
 ## 0.2.0
 
 - Most derivations on current nixpkgs use structured attributes, which `nix
