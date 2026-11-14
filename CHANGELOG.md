@@ -8,6 +8,11 @@
   naming a derivation" instead of holding the hosts that need it. It is now
   read as a build that cannot run on this machine. Found by the new CI job
   on Nix 2.19.4 and 2.24.14.
+- On Nix before 2.24, the full trace eppur asks for after an evaluation
+  failure came back as "cached failure of attribute" with no trace in it. The
+  package an error passed through was then looked for in the shorter message
+  only, and the flake input the failure visibly involves was not tested
+  first. The trace is now evaluated without the evaluation cache.
 
 ## 0.2.0
 

@@ -518,10 +518,13 @@ impl Nix {
 
     /// The full error of evaluating `attr`, with every frame of its trace:
     /// what nix shows by default is cut short before the packages an error
-    /// passed through. Not shown to the user.
+    /// passed through. Not shown to the user. Evaluated without the cache,
+    /// which on Nix before 2.24 answers a failure it has seen with "cached
+    /// failure of attribute" and no trace.
     pub fn eval_trace(&self, attr: &str) -> Result<String> {
         let mut cmd = command();
         cmd.args(["eval", "--raw", "--show-trace"])
+            .args(uncached(false))
             .arg(self.installable(attr));
         let out = run(cmd, "nix eval")?;
         Ok(logparse::strip_ansi(&String::from_utf8_lossy(&out.stderr)))
