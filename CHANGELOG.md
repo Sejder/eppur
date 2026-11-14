@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
 
 - Most derivations on current nixpkgs use structured attributes, which `nix
   derivation show` prints outside `env`, and eppur read `pname` and
