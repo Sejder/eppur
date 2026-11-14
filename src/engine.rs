@@ -73,6 +73,8 @@ pub struct Engine {
     pub pin_insecure: bool,
     /// Evaluated copies of packages, by target, attr, revision and overlays.
     pub copies: std::cell::RefCell<HashMap<String, Option<Copy>>>,
+    /// `refused_donor`'s answers, by target, input and attr.
+    pub refused_donors: std::cell::RefCell<HashMap<String, Option<DonorCopy>>>,
     /// Whether a package set lost an attr between two revisions, by old
     /// revision, new revision, system and attr.
     pub lost: std::cell::RefCell<HashMap<(String, String, String, String), bool>>,
@@ -172,6 +174,22 @@ struct Wanted {
     /// nixpkgs refuses it as insecure: only a copy this machine already
     /// built may be pinned.
     insecure: bool,
+    /// No older nixpkgs has it either: only a donor's copy can be pinned.
+    donor_only: bool,
+    /// The packages nixpkgs refused, by name and version, which a donor's
+    /// copy must not bring along.
+    refused: Vec<String>,
+}
+
+/// A pin to a donor's copy of a package nixpkgs refuses as insecure, made
+/// before the system evaluated, so before anyone could see what depends on
+/// it. Checked once it evaluates.
+struct DonorCheck {
+    input: String,
+    attr: String,
+    donor: String,
+    drv: String,
+    refused: Vec<String>,
 }
 
 /// A failure no pin can help with, which a flake input may have caused.
@@ -199,6 +217,9 @@ fn counterparts(
         .collect()
 }
 
+/// A donor's copy of a package: the donor, its locked input, the copy.
+pub type DonorCopy = (String, Value, Copy);
+
 /// A package as one nixpkgs builds it for a target.
 #[derive(Debug, Clone)]
 pub struct Copy {
@@ -222,6 +243,7 @@ struct State {
     retrying: BTreeMap<(String, String), Pin>,
     /// Pins moved to a donor in this run, with the pin each replaced.
     upgrading: BTreeMap<(String, String), Pin>,
+    donor_checks: Vec<DonorCheck>,
     inputs: Vec<String>,
     drv: Option<String>,
     /// The pins file the builds saw in the round this target built in, and
@@ -705,10 +727,16 @@ impl Engine {
         let mut entry = base.clone().unwrap_or_default();
         let held_before = entry.held.take();
         for (input, attr, pin) in entry.iter().filter(|(_, _, p)| p.insecure) {
-            log::warn(&format!(
-                "{target}: {attr} ({input}) is kept at {}, which nixpkgs now marks insecure",
-                describe_dated(&pin.locked)
-            ));
+            match &pin.donor {
+                Some(donor) => log::warn(&format!(
+                    "{target}: {attr} ({input}) is taken from {donor} at {}, since nixpkgs marks it insecure",
+                    describe_dated(&pin.locked)
+                )),
+                None => log::warn(&format!(
+                    "{target}: {attr} ({input}) is kept at {}, which nixpkgs now marks insecure",
+                    describe_dated(&pin.locked)
+                )),
+            }
         }
         let held_lock = held_before
             .as_ref()
@@ -785,6 +813,7 @@ impl Engine {
             old_lock,
             retrying,
             upgrading: BTreeMap::new(),
+            donor_checks: Vec::new(),
             inputs,
             drv: None,
             built_with: None,
@@ -1064,6 +1093,10 @@ impl Engine {
                 Err(msgs) => eval_failed.push((i, msgs)),
             }
         }
+        for (i, drv) in &built {
+            self.check_donor_pins(&mut states[*i], drv)?;
+        }
+        built.retain(|(i, _)| states[*i].status == Status::Active);
         let drvs: Vec<String> = built.iter().map(|(_, d)| d.clone()).collect();
         let mut outcome = if drvs.is_empty() {
             None
@@ -1227,6 +1260,7 @@ impl Engine {
                 continue;
             }
             let error = msgs.first().map(|m| logparse::headline(m));
+            let refused = logparse::insecure_names(&msgs);
             let mut context: Option<Vec<String>> = None;
             let mut wanted = Vec::new();
             for (attr, insecure) in attrs {
@@ -1276,12 +1310,33 @@ impl Engine {
                         trail: Vec::new(),
                         error: error.clone(),
                         insecure,
+                        donor_only: false,
+                        refused: refused.clone(),
                     }),
                     None if insecure => {
-                        st.status = Status::Failed(format!(
-                            "nixpkgs refuses {attr} because it is marked as insecure, and no older nixpkgs that built has it"
-                        ));
-                        break;
+                        let candidates: Vec<String> = std::iter::once(&attr)
+                            .chain(context.iter().flatten())
+                            .cloned()
+                            .collect();
+                        let Some((outer, members)) = self.refused_members(st, &candidates) else {
+                            st.status = Status::Failed(format!(
+                                "nixpkgs refuses {attr} because it is marked as insecure, and neither an older nixpkgs that built nor a donor has it"
+                            ));
+                            break;
+                        };
+                        wanted.push(Wanted {
+                            members: members.into_iter().map(|i| (i, outer.clone())).collect(),
+                            reason: Reason::Eval,
+                            failed_drv: None,
+                            root_drv: None,
+                            leaf: false,
+                            cause: format!("nixpkgs now marks {attr} as insecure"),
+                            trail: Vec::new(),
+                            error: error.clone(),
+                            insecure,
+                            donor_only: true,
+                            refused: refused.clone(),
+                        });
                     }
                     None => {
                         st.unpinnable.replace(Some(Unpinnable {
@@ -1402,6 +1457,8 @@ impl Engine {
                         trail: graph.trail(drv, root, closure),
                         error: None,
                         insecure: false,
+                        donor_only: false,
+                        refused: Vec::new(),
                     });
                 }
             }
@@ -1569,6 +1626,20 @@ impl Engine {
                     continue;
                 };
                 if let Some(mut pin) = st.retrying.remove(&(input.clone(), attr.clone())) {
+                    if w.insecure && pin.insecure && pin.donor.is_some() {
+                        match self.refused_donor_pin(st, input, attr, &w, checked) {
+                            Some(again) => {
+                                kept.push(format!("{input} (since {})", pin.since));
+                                st.entry.insert(input, attr, Pin { since: pin.since, ..again });
+                            }
+                            None => skipped.push((
+                                attr.clone(),
+                                input.clone(),
+                                "nixpkgs still marks it insecure, and no donor has a copy already built that nixpkgs does not refuse any more".into(),
+                            )),
+                        }
+                        continue;
+                    }
                     pin.checked_nar_hash = checked;
                     if w.failed_drv.is_some() || w.error.is_some() {
                         pin.failed_drv = w.failed_drv.clone();
@@ -1585,6 +1656,17 @@ impl Engine {
                     let pin = self.with_donor(st, input, attr, pin, true);
                     let pin = self.versioned(st, attr, pin);
                     st.entry.insert(input, attr, pin);
+                    continue;
+                }
+                if w.donor_only {
+                    match self.refused_donor_pin(st, input, attr, &w, checked) {
+                        Some(pin) => added.push((input.clone(), attr.clone(), pin)),
+                        None => skipped.push((
+                            attr.clone(),
+                            input.clone(),
+                            "nixpkgs marks it insecure, no older nixpkgs that built has it, and no donor has a copy already built that nixpkgs does not refuse".into(),
+                        )),
+                    }
                     continue;
                 }
                 // Pinned when this target last built: that revision is the one
@@ -1635,11 +1717,15 @@ impl Engine {
                         pinned_copy_built(&self.nix, &st.target, &system, attr, &locked, overlays)
                     }
                 {
+                    if let Some(pin) = self.refused_donor_pin(st, input, attr, &w, checked) {
+                        added.push((input.clone(), attr.clone(), pin));
+                        continue;
+                    }
                     skipped.push((
                         attr.clone(),
                         input.clone(),
                         format!(
-                            "nixpkgs marks it insecure, and this machine has not built its copy at {}, so pinning it would install it rather than keep it",
+                            "nixpkgs marks it insecure, this machine has not built its copy at {}, so pinning it would install it rather than keep it, and no donor has a copy already built that nixpkgs does not refuse",
                             describe_dated(&locked)
                         ),
                     ));
@@ -1722,6 +1808,223 @@ impl Engine {
             }
             for (a, i, why) in skipped {
                 log::detail(&format!("{}: not pinning {a} ({i}): {why}", st.target));
+            }
+        }
+        Ok(())
+    }
+
+    /// The first of `candidates` that no longer evaluates in some package
+    /// sets while a donor has a copy of it nixpkgs does not refuse, already
+    /// built, with those sets. Each set and donor are first compared on all
+    /// candidates in one plain evaluation, and only the candidates that pass
+    /// are evaluated in the target's configuration.
+    fn refused_members(&self, st: &State, candidates: &[String]) -> Option<(String, Vec<String>)> {
+        let candidates: Vec<String> = candidates
+            .iter()
+            .filter(|a| resolve::is_attr_name(a))
+            .cloned()
+            .collect();
+        if self.donors.is_empty() || candidates.is_empty() {
+            return None;
+        }
+        let system = self.system_of(st).to_string();
+        let mut likely: HashMap<String, BTreeSet<String>> = HashMap::new();
+        for input in &st.inputs {
+            let Some(locked) = self.new_lock.locked(input) else {
+                continue;
+            };
+            for donor in self.donors.iter().filter(|d| *d != input) {
+                let Some(donor_locked) = self.new_lock.locked(donor) else {
+                    continue;
+                };
+                let found = resolve::lost_between(&donor_locked, &locked, &system, &candidates)
+                    .unwrap_or_else(|_| {
+                        candidates
+                            .iter()
+                            .take(4)
+                            .map(|a| (a.clone(), true))
+                            .collect()
+                    });
+                for (attr, lost) in found {
+                    if lost {
+                        likely.entry(attr).or_default().insert(input.clone());
+                    }
+                }
+            }
+        }
+        candidates.iter().find_map(|attr| {
+            let members: Vec<String> = likely
+                .get(attr)?
+                .iter()
+                .filter(|input| {
+                    self.new_lock.locked(input).is_some_and(|locked| {
+                        self.copy(&st.target, &st.system, attr, &locked, true)
+                            .is_none()
+                    }) && self.refused_donor(st, input, attr).is_some()
+                })
+                .cloned()
+                .collect();
+            (!members.is_empty()).then(|| (attr.clone(), members))
+        })
+    }
+
+    /// The donor with the highest version of `attr` that evaluates, so
+    /// nixpkgs does not refuse it, and is already built or in a substituter,
+    /// as (donor, its locked input, its copy).
+    fn refused_donor(&self, st: &State, input: &str, attr: &str) -> Option<DonorCopy> {
+        let key = format!("{}\0{input}\0{attr}", st.target);
+        if let Some(hit) = self.refused_donors.borrow().get(&key) {
+            return hit.clone();
+        }
+        let own = self.new_lock.nar_hash(input);
+        let mut best: Option<(String, Value, Copy)> = None;
+        for donor in &self.donors {
+            let Some(locked) = self.new_lock.locked(donor) else {
+                continue;
+            };
+            if donor == input || locked["narHash"].as_str() == own.as_deref() {
+                continue;
+            }
+            let Some(copy) = self.copy(&st.target, &st.system, attr, &locked, true) else {
+                continue;
+            };
+            let better = best.as_ref().is_none_or(|(_, _, b)| {
+                resolve::compare_versions(&copy.version, &b.version) == std::cmp::Ordering::Greater
+            });
+            if better {
+                best = Some((donor.clone(), locked, copy));
+            }
+        }
+        // The overlays are chosen for the donor taken only, since choosing
+        // evaluates the configuration again and says what it chose.
+        let found = best.and_then(|(donor, locked, copy)| {
+            let overlays = choose_overlays(&self.nix, &st.target, input, attr, &locked);
+            let copy = if overlays.unwrap_or(false) == copy.overlays.unwrap_or(false) {
+                copy
+            } else {
+                self.copy(
+                    &st.target,
+                    &st.system,
+                    attr,
+                    &locked,
+                    overlays.unwrap_or(false),
+                )?
+            };
+            crate::nix::available(&copy.out).then_some((donor, locked, copy))
+        });
+        self.refused_donors.borrow_mut().insert(key, found.clone());
+        found
+    }
+
+    /// A pin of `attr`, which nixpkgs refuses as insecure, to a donor's copy
+    /// that it does not refuse. Whether anything else in the system depends
+    /// on it, and whether it still brings the refused package along, is only
+    /// known once the system evaluates, so that is checked then.
+    fn refused_donor_pin(
+        &self,
+        st: &mut State,
+        input: &str,
+        attr: &str,
+        w: &Wanted,
+        checked: String,
+    ) -> Option<Pin> {
+        let (donor, locked, copy) = self.refused_donor(st, input, attr)?;
+        log::info(&format!(
+            "{}: {attr} ({input}) is pinned to {donor} at {}: it has {attr} {} already built, which nixpkgs does not refuse",
+            st.target,
+            describe_dated(&locked),
+            copy.version
+        ));
+        st.donor_checks.push(DonorCheck {
+            input: input.to_string(),
+            attr: attr.to_string(),
+            donor: donor.clone(),
+            drv: copy.drv.clone(),
+            refused: w.refused.clone(),
+        });
+        Some(Pin {
+            locked,
+            since: date::format(self.today),
+            reason: w.reason,
+            failed_drv: w.failed_drv.clone(),
+            trail: w.trail.clone(),
+            error: w.error.clone(),
+            overlays: copy.overlays,
+            checked_nar_hash: checked,
+            root_drv: w.root_drv.clone(),
+            tried: None,
+            donor: Some(donor),
+            leaf: false,
+            version: Some(copy.version).filter(|v| !v.is_empty()),
+            insecure: w.insecure,
+        })
+    }
+
+    /// Check the donor pins `refused_donor_pin` made against the system they
+    /// now evaluate in, before it is built. The pin is dropped and the target
+    /// held when the copy still brings a refused package along (a donor
+    /// without the marking), when other packages depend on it (it would bring
+    /// the donor's libraries along), or when the system uses the package but
+    /// not that copy, as with an override: that would be built, not taken
+    /// already built. A set the system does not use the package from at all
+    /// keeps its pin; it changes nothing.
+    fn check_donor_pins(&self, st: &mut State, top: &str) -> Result<()> {
+        let checks = std::mem::take(&mut st.donor_checks);
+        if checks.is_empty() {
+            return Ok(());
+        }
+        let graph = self.nix.show_drvs(&[top.to_string()])?;
+        let closure = graph.closure(top);
+        let name_of = |d: &str| logparse::strip_version(crate::summary::drv_name(d)).to_string();
+        for check in checks {
+            let why = if closure.contains(&check.drv) {
+                let dependents =
+                    graph
+                        .ancestors(&check.drv, &closure, ASCENT_CAP)
+                        .map_or(usize::MAX, |a| {
+                            a.iter()
+                                .filter(|d| **d != check.drv && graph.is_package(d))
+                                .count()
+                        });
+                let brings = graph
+                    .closure(&check.drv)
+                    .into_iter()
+                    .map(|d| graph.display_name(&d))
+                    .find(|n| check.refused.contains(n));
+                if let Some(name) = brings {
+                    Some(format!(
+                        "the copy {} has still depends on {name}",
+                        check.donor
+                    ))
+                } else if dependents > 0 {
+                    Some(format!(
+                        "the copy {} has would be used by {}",
+                        check.donor,
+                        if dependents == usize::MAX {
+                            "too many other packages".to_string()
+                        } else {
+                            plural(dependents, "other package")
+                        }
+                    ))
+                } else {
+                    None
+                }
+            } else {
+                let name = name_of(&check.drv);
+                closure.iter().any(|d| name_of(d) == name).then(|| {
+                    format!(
+                        "the configuration changes the copy {} has, so it would be built rather than taken already built",
+                        check.donor
+                    )
+                })
+            };
+            if let Some(why) = why {
+                st.entry.remove(&check.input, &check.attr);
+                st.status = Status::Failed(format!(
+                    "nixpkgs refuses {} ({}) as insecure, and {why}, so it is not taken from a donor",
+                    check.attr, check.input
+                ));
+                return Ok(());
             }
         }
         Ok(())

@@ -880,6 +880,7 @@ pub fn reconcile(at: &Where, args: &BuildArgs, how: Activation) -> Result<ExitCo
             retry_same_after_days: cfg.retry_same_derivation_after_days,
             pin_insecure: cfg.pin_insecure,
             copies: Default::default(),
+            refused_donors: Default::default(),
             lost: Default::default(),
         })
     };
@@ -1116,6 +1117,9 @@ pub fn merge(at: &Where, other: &Path) -> Result<ExitCode> {
 
 fn reason_words(pin: &Pin) -> &'static str {
     match pin.reason {
+        _ if pin.insecure && pin.donor.is_some() => {
+            "is marked insecure upstream; taken from a donor without the refused version"
+        }
         _ if pin.insecure => "is marked insecure upstream; kept at the copy already built",
         Reason::Build => "failed to build",
         Reason::Eval => "failed to evaluate",

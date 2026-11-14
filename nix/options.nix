@@ -89,7 +89,7 @@ in
     type = types.listOf types.str;
     default = [ ];
     example = [ "nixpkgs-stable" ];
-    description = "Flake inputs, as named in flake.lock, that a failed package may be pinned to instead of the revision it last built with, when one has a newer version of it that is already built or in a substituter. Only for packages nothing else in the system depends on.";
+    description = "Flake inputs, as named in flake.lock, that a failed package may be pinned to instead of the revision it last built with, when one has a newer version of it that is already built or in a substituter, and for a package nixpkgs refuses as insecure with no older copy in the store to keep, when one has a copy nixpkgs does not refuse. Only for packages nothing else in the system depends on.";
   };
   inputDeny = mkOption {
     type = types.listOf types.str;
@@ -105,7 +105,7 @@ in
   pinInsecure = mkOption {
     type = types.bool;
     default = true;
-    description = "When nixpkgs starts refusing a package as insecure, pin it to the copy this machine already built, so the rest of the host still updates; the pin is marked insecure in status and warned about on every run. false holds the host instead, as nixpkgs' refusal intends, until the package is fixed, removed, or allowed with nixpkgs.config.permittedInsecurePackages.";
+    description = "When nixpkgs starts refusing a package as insecure, pin it to the copy this machine already built, or when there is none to a donor's copy nixpkgs does not refuse, so the rest of the host still updates; the pin is marked insecure in status and warned about on every run. false holds the host instead, as nixpkgs' refusal intends, until the package is fixed, removed, or allowed with nixpkgs.config.permittedInsecurePackages.";
   };
   switcher = mkOption {
     type = types.enum [

@@ -13,6 +13,18 @@
   is warned about on every run. `programs.eppur.pinInsecure = false` keeps the
   old behaviour of holding the host. Unfree and unsupported packages still
   hold the host.
+- A package nixpkgs refuses as insecure, with no copy of it in this machine's
+  store to keep, held the host even when a donor had a copy nixpkgs does not
+  refuse, such as a fixed version that reached `nixos-unstable-small` before
+  `nixos-unstable`, or one the configuration only now starts to use. When no
+  older copy can be kept, the package is now pinned to a donor whose copy
+  evaluates and is already built or in a substituter. Once the system
+  evaluates with the pin, and before it is built, the pin is dropped and the
+  target held, as before, when the copy still contains the refused package,
+  when other packages in the system depend on it, or when the configuration
+  overrides it, which would build it from the donor's sources. The pin stays
+  marked `insecure` and is warned about on every run, since a donor behind on
+  the marking may still ship an older vulnerable version.
 
 ## 0.1.9
 

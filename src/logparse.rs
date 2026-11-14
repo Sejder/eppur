@@ -210,6 +210,20 @@ fn refusal_is_breakage(why: &str) -> bool {
         && !why.contains("unsupported")
 }
 
+/// The packages, by name and version, that nixpkgs refused as insecure.
+pub fn insecure_names(messages: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for msg in messages {
+        let msg = strip_ansi(msg);
+        for c in REFUSED.captures_iter(&msg) {
+            if refusal_is_insecure(&c[3]) && !out.iter().any(|n| n == &c[1]) {
+                out.push(c[1].to_string());
+            }
+        }
+    }
+    out
+}
+
 /// Whether a refusal is for being marked insecure and nothing that is the
 /// user's own setting.
 fn refusal_is_insecure(why: &str) -> bool {
@@ -512,6 +526,18 @@ mod tests {
                     reason: "it is marked as insecure".into()
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn insecure_names_keep_the_version() {
+        let msgs = vec![
+            "error: Refusing to evaluate package 'python3.14-python-jose-3.5.0' in /nix/store/x-source/pkgs/development/python-modules/python-jose/default.nix:80 because it is marked as insecure".to_string(),
+            "error: Refusing to evaluate package 'cuda-merged-12.8' in /nix/store/x-source/pkgs/c.nix:1 because it has an unfree license".to_string(),
+        ];
+        assert_eq!(
+            insecure_names(&msgs),
+            vec!["python3.14-python-jose-3.5.0".to_string()]
         );
     }
 

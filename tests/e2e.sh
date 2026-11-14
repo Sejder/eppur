@@ -320,6 +320,11 @@ cat >"$sys/flake.nix" <<EOF
       nixosConfigurations.q = mkHost "q" (p: [ p.realfail ]);
       nixosConfigurations.r = mkHost "r" (p: [ p.deadlink ]);
       nixosConfigurations.d = mkEmbedding "d" (p: [ p.hello ]);
+      nixosConfigurations.g = mkHost "g" (p: if builtins.pathExists ./use-hello then [ p.hello ] else [ p.app ]);
+      nixosConfigurations.h = mkHost "h" (p: if builtins.pathExists ./use-hello then [ (derivation {
+        name = "wraps-hello-1.0"; pname = "wraps-hello"; inherit system; hello = p.hello;
+        builder = "/bin/sh"; args = [ "-c" "echo \$hello > \$out" ];
+      }) ] else [ p.app ]);
       nixosConfigurations.o = mkOverlaid "o" (final: prev: { helloSuffix = "-patched"; }) (p: [ p.hello ]);
       nixosConfigurations.o2 = mkOverlaid "o2" (final: prev: { helloSuffix = prev.helloTag { flavor = "patched"; }; }) (p: [ p.hello ]);
       homeConfigurations.alice = mkHostOf "homes" "alice" (p: [ p.hello ]) { };
@@ -1270,6 +1275,39 @@ eppur_ build --update --no-commit || fail "pinning hello to the donor gave up"
 expect_log "host a: hello (toypkgs) is pinned to toydonor"
 [ "$(field a toypkgs hello donor)" = toydonor ] || fail "the new hello pin is not from toydonor"
 expect_built a hello-90
+git -C "$sys" checkout -q -- flake.lock pins.json
+
+step "donors: an insecure package this machine never built is taken from a donor that does not refuse it"
+revision fixed false 84 ok
+eppur_ build --update --no-commit || fail "a did not build on 84"
+hello84="$(nix build --no-link --print-out-paths --impure --expr "(import $toy { system = \"$system\"; }).hello")"
+# shellcheck disable=SC2046
+nix store delete $(nix-store -q --referrers-closure "$hello84") >/dev/null 2>&1 || fail "could not delete $hello84"
+revision fixed false insecure ok
+eppur_ build --update --no-commit || fail "pinning the insecure hello to the donor gave up"
+expect_log "host a: hello (toypkgs) is pinned to toydonor"
+[ "$(field a toypkgs hello donor)" = toydonor ] || fail "the insecure hello pin is not from toydonor"
+[ "$(field a toypkgs hello insecure)" = 1 ] || fail "the insecure hello pin is not marked insecure"
+expect_built a hello-90
+eppur_ build --no-commit || fail "building a again with the donor pin gave up"
+expect_log "host a: hello (toypkgs) is taken from toydonor at "
+reject_log "is kept at"
+eppur_ why hello || fail "eppur why hello failed"
+expect_log "taken from a donor without the refused version"
+git -C "$sys" checkout -q -- flake.lock pins.json
+
+step "donors: an insecure package the configuration only now starts to use is taken from a donor"
+write_config "" '"donors": ["toydonor"]' '"g", "h"'
+eppur_ build --update --no-commit || fail "g and h did not build without hello"
+touch "$sys/use-hello"
+git -C "$sys" add use-hello
+eppur_ build --no-commit || fail "pinning the insecure hello on g to the donor gave up"
+expect_log "host g: hello (toypkgs) is pinned to toydonor"
+[ "$(field g toypkgs hello donor)" = toydonor ] || fail "the hello pin on g is not from toydonor"
+expect_built g hello-90
+case "$(held_reason h)" in *"the copy toydonor has would be used by 1 other package, so it is not taken from a donor"*) ;; *) fail "h should be held, since wraps-hello depends on hello: $(held_reason h)" ;; esac
+expect_pins h ""
+git -C "$sys" rm -q -f use-hello
 git -C "$sys" checkout -q -- flake.lock pins.json
 write_config ""
 

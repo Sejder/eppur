@@ -193,11 +193,21 @@ vulnerability, and it silences nixpkgs' alarm, so eppur keeps raising it:
 - every run logs a warning for each such pin until it is gone;
 - it ages like any other pin, so `warnAfterDays` reports it as stale.
 
-A pin is only made to a copy that is already in this machine's store, built
-for a system that ran before. A package the configuration only now starts to
-use, or one whose copy is gone from the store, is not pinned; the host is held,
-as nixpkgs intends. The pin is retried like any other when its input moves, and
-is gone once nixpkgs ships a fixed version or drops the marking. To keep the
+A pin to an older revision is only made to a copy that is already in this
+machine's store, built for a system that ran before. A package the
+configuration only now starts to use, or one whose copy is gone from the store,
+is not pinned there, since that would install it. Instead it is taken from a
+[donor](#concepts) whose copy nixpkgs does not refuse, such as a channel that
+already has the fix: one already built or in a substituter. Once the system
+evaluates with it, and before anything is built, the pin is dropped and the
+host held if the copy still contains the refused package (a donor that lacks
+the marking), if any other package in the system depends on it, or if the
+configuration overrides the package, which would build it from the donor's
+sources. A donor that is behind on the marking may still ship an older
+vulnerable version, so the alarm stays on: the pin is marked `insecure`, every
+run warns that the package is taken from a donor, and `eppur why` says so.
+Without such a donor the host is held, as nixpkgs intends. The pin is retried like any other when its input moves, and is gone
+once nixpkgs ships a fixed version or drops the marking. To keep the
 alarm loud instead, set `programs.eppur.pinInsecure = false`: the host is then
 held until the package is fixed, removed, or allowed. Allowing it with
 `permittedInsecurePackages` takes the new revision's copy and needs no pin.
@@ -241,8 +251,11 @@ substituters, the pin is made to the donor: it builds nothing and is not a
 step back. An existing pin moves to a donor once one has such a copy, and goes
 back to the pin it replaced if the donor's copy fails. Only a package nothing
 else in the system depends on is taken from a donor, since its copy brings the
-donor's libraries along. The input must be in `flake.lock`; it does not have
-to be used by your configuration:
+donor's libraries along. A package nixpkgs refuses as insecure, which has no
+older copy to keep, is taken from a donor whose copy nixpkgs does not refuse,
+whatever its version (see the insecure packages above). The input must be in
+`flake.lock`; it does not have to be used by your configuration, and it may
+also be one of your package sets:
 
 ```nix
 inputs.nixpkgs-stable.url = "https://channels.nixos.org/nixos-26.05/nixexprs.tar.zst";
@@ -385,10 +398,10 @@ required, the rest default as the module options do):
 | `quiet` | `false` | always run as `--quiet` |
 | `commit` | `false` | commit `flake.lock` and `pins.json` after each run, as with `--commit` |
 | `pinnedOverlays` | `true` | apply your own nixpkgs overlays to pinned packages (see below) |
-| `donors` | `[ ]` | flake inputs a failed package may be pinned to when one has a newer, already built copy of it (see [Donor](#concepts)) |
+| `donors` | `[ ]` | flake inputs a failed package may be pinned to when one has a newer, already built copy of it, or an insecure one when one has a copy nixpkgs does not refuse (see [Donor](#concepts)) |
 | `inputDeny` | `[ ]` | flake inputs never to roll back in `flake.lock` when they break a build; a trailing `*` matches a prefix, so `[ "*" ]` turns rolling back off (see [Flake input](#concepts)) |
 | `retrySameDerivationAfterDays` | `7` | retry a build failure whose derivation an update did not change only after this many days; `0` on every move of its input |
-| `pinInsecure` | `true` | pin a package nixpkgs newly refuses as insecure to the copy this machine already built, instead of holding the host; `false` holds it (see [Insecure](#concepts)) |
+| `pinInsecure` | `true` | pin a package nixpkgs newly refuses as insecure to the copy this machine already built, or else to a donor's copy that is not refused, instead of holding the host; `false` holds it (see [Insecure](#concepts)) |
 | `package` | this flake's | the eppur package |
 | `nixpkgs.<input>` | `{ }` | another nixpkgs to import with pins applied: `source`, `config` (default: this host's `nixpkgs.config`), `argName` |
 | `packageSets` | read-only | every package set eppur pins on this machine, keyed by input |
