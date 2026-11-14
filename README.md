@@ -325,7 +325,7 @@ command. `-q` (`--quiet`) prints only pins, unpins, holds, warnings, errors and
 files left uncommitted; nix's own messages are shown only when eppur could
 not handle them. `-v` (`--verbose`) overrides `programs.eppur.quiet`, and
 adds eppur's reasoning: each target that built, why a package set was not
-pinned, what a merge took. Up to four evaluations run at once.
+pinned, what a merge took. Up to four evaluations run at once (`evalJobs`).
 Every command but `status` and `why` says first which flake and config it
 acts on, since by default both come from `/etc/eppur.json` or
 `~/.config/eppur.json`, wherever you run it. A `--config` (or
@@ -347,9 +347,24 @@ Options of `build`, `switch` and `boot`:
 | `--timeout DURATION` | stop updating, evaluating and building after this long (`12h`, `45min`, `90s`); the files are restored and activation is never cut short |
 | `--built-link PATH` | a GC root pointing at this machine's built system, removed when it did not build, so a separate step can activate it |
 | `--old-lock FILE` | the lock to pin back to, instead of the last good one |
+| `--json` | print one JSON object on stdout describing the run (see below); the log stays on stderr |
 | `--max-rounds N` | give up after N build rounds (8) |
 | `--max-new-pins N` | hold a host, or give up on this machine's own, rather than pin more than N new packages for it in one run (10) |
+| `--nix-arg ARG` | an extra argument for the nix commands of the run, placed before the subcommand, so a global setting such as `--max-jobs`, `--builders` or `--option NAME VALUE` (not `--impure` or `--override-input`); one nix refuses stops the run with an error before anything builds; the switcher does not get them; repeatable, one `--nix-arg` per argument, as in `--nix-arg --max-jobs --nix-arg 2`; added after `nixArgs` |
+| `--eval-jobs N` | evaluate at most N targets at once (`evalJobs`, 4) |
 | `--system SYSTEM` | the system for eval checks when a target's own cannot be evaluated |
+
+`--json` writes the report when the run ends, on stdout only; everything else
+eppur prints, and the output of the switcher, goes to stderr. It is written for
+an error too (exit 2, with `error` set), and for `--dry-run`, but not when the
+run is interrupted or the command line is refused. Fields:
+`version` (1), `exit` and `exitMeaning` (the exit codes below), `error`,
+`dryRun`, `activation` (`none`, `switch` or `boot`), `activated` (the switcher
+ran and succeeded), `closing` (`unchanged`, `uncommitted`, `committed` or
+`no-repository`) and `committed`, `built` (`kind` and `name` of each target
+that built), `failed`, `heldCount`, and the changes of the run as the log words
+them, in `pinned`, `unpinned`, `held`, `released` and `moved`. Fields may be
+added; none will change meaning within version 1.
 
 eppur works in a dirty tree. When it commits, it commits only `flake.lock`
 and `pins.json`, without running git hooks or signing. A run takes a lock on the
@@ -376,7 +391,8 @@ required, the rest default as the module options do):
 { "kind": "nixos", "self": "laptop", "flake": "/home/alice/nixos",
   "hosts": ["laptop"], "homes": [], "input": "nixpkgs", "warnAfterDays": 14,
   "deny": [], "quiet": false, "commit": false, "switcher": "nh",
-  "donors": [], "retrySameDerivationAfterDays": 7, "pinInsecure": true }
+  "donors": [], "retrySameDerivationAfterDays": 7, "pinInsecure": true,
+  "nixArgs": [], "evalJobs": 4 }
 ```
 
 ## Options
@@ -402,6 +418,8 @@ required, the rest default as the module options do):
 | `inputDeny` | `[ ]` | flake inputs never to roll back in `flake.lock` when they break a build; a trailing `*` matches a prefix, so `[ "*" ]` turns rolling back off (see [Flake input](#concepts)) |
 | `retrySameDerivationAfterDays` | `7` | retry a build failure whose derivation an update did not change only after this many days; `0` on every move of its input |
 | `pinInsecure` | `true` | pin a package nixpkgs newly refuses as insecure to the copy this machine already built, or else to a donor's copy that is not refused, instead of holding the host; `false` holds it (see [Insecure](#concepts)) |
+| `nixArgs` | `[ ]` | extra arguments for the nix commands of a run, one element per argument: `[ "--max-jobs" "2" ]`, `--builders`, `--option NAME VALUE`; see `--nix-arg`, which adds to them |
+| `evalJobs` | `4` | how many evaluations run at once; each holds a whole system in memory, so lower it on a small machine |
 | `package` | this flake's | the eppur package |
 | `nixpkgs.<input>` | `{ }` | another nixpkgs to import with pins applied: `source`, `config` (default: this host's `nixpkgs.config`), `argName` |
 | `packageSets` | read-only | every package set eppur pins on this machine, keyed by input |

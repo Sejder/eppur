@@ -29,3 +29,31 @@ jobs:
           git config --global user.name ci
           git config --global user.email ci@localhost
           EPPUR="$PWD/result/bin/eppur" tests/e2e.sh
+
+  compat:
+    name: e2e on ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Nix 2.19.4
+            install_url: https://releases.nixos.org/nix/nix-2.19.4/install
+          - name: Nix 2.24.14
+            install_url: https://releases.nixos.org/nix/nix-2.24.14/install
+          - name: Nix (current)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cachix/install-nix-action@v31
+        with:
+          install_url: ${{ matrix.install_url }}
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+      - name: build
+        run: cargo build --locked
+      - name: end to end
+        run: |
+          nix --version
+          git config --global user.name ci
+          git config --global user.email ci@localhost
+          EPPUR="$PWD/target/debug/eppur" tests/e2e.sh

@@ -315,7 +315,7 @@
           homeUpgrade = home.config.systemd.user.services.eppur-upgrade;
           failedAssertions = cfg: builtins.filter (a: !a.assertion) cfg.assertions;
         in
-        {
+        nixpkgs.lib.filterAttrs (name: _: name != "autoupgrade-vm" || system == "x86_64-linux") {
           package = self.packages.${system}.default;
           overlay =
             assert (overlay { }).hello.drvPath == pkgs.hello.drvPath;
@@ -382,6 +382,8 @@
             assert settings.quiet == false;
             assert settings.switcher == "nh";
             assert settings.commit == false;
+            assert settings.nixArgs == [ ];
+            assert settings.evalJobs == 4;
             assert upgrade.serviceConfig.User == "alice";
             assert builtins.match ".*eppur build --built-link /run/eppur/system --no-commit --timeout 12h --update nixpkgs" upgrade.serviceConfig.ExecStart != null;
             assert builtins.match "[+]/nix/store/.*-eppur-activate" upgrade.serviceConfig.ExecStartPost != null;
@@ -421,6 +423,92 @@
               EPPUR_BUILT_LINK="$PWD/missing" ${script}
               touch $out
             '';
+          autoupgrade-vm = pkgs.testers.runNixOSTest {
+            name = "eppur-autoupgrade";
+            node.pkgsReadOnly = false;
+            nodes.machine =
+              { pkgs, ... }:
+              {
+                imports = [ self.nixosModules.default ];
+                networking.hostName = "machine";
+                nix.settings = {
+                  experimental-features = [
+                    "nix-command"
+                    "flakes"
+                  ];
+                  extra-sandbox-paths = [ "${pkgs.coreutils}" ];
+                  substituters = [ ];
+                };
+                virtualisation.memorySize = 4096;
+                systemd.oomd.enable = false;
+                environment.systemPackages = [ pkgs.coreutils ];
+                virtualisation.additionalPaths = [ pkgs.emptyDirectory ];
+                programs.eppur = {
+                  enable = true;
+                  pinsFile = pins;
+                  hosts = [ "machine" ];
+                  flake = "/root/flake";
+                  autoUpgrade = {
+                    enable = true;
+                    user = "root";
+                    operation = "switch";
+                    dates = "03:00";
+                  };
+                };
+                specialisation.next.configuration = {
+                  environment.etc."eppur-next".text = "next";
+                };
+              };
+            testScript =
+              { nodes, ... }:
+              let
+                top = nodes.machine.system.build.toplevel;
+                next = "${top}/specialisation/next";
+                flakeNix = pkgs.writeText "flake.nix" ''
+                  {
+                    inputs.dummy = {
+                      url = "path:${pkgs.emptyDirectory}";
+                      flake = false;
+                    };
+                    outputs = _: {
+                      nixosConfigurations.machine = {
+                        pkgs.stdenv.hostPlatform.system = "${system}";
+                        config.programs.eppur = {
+                          enable = true;
+                          name = "machine";
+                          pinsFile = ./pins.json;
+                          packageSets = { };
+                        };
+                        config.system.build.toplevel = derivation {
+                          name = "toplevel-machine";
+                          system = "${system}";
+                          builder = "/bin/sh";
+                          args = [
+                            "-c"
+                            "${pkgs.coreutils}/bin/ln -s ${next} $out || exit 1"
+                          ];
+                        };
+                      };
+                    };
+                  }
+                '';
+              in
+              ''
+                machine.wait_for_unit("multi-user.target")
+                machine.wait_for_unit("eppur-upgrade.timer")
+                machine.fail("test -e /etc/eppur-next")
+                machine.succeed("mkdir -p /root/flake")
+                machine.copy_from_host("${flakeNix}", "/root/flake/flake.nix")
+                machine.succeed("echo '{\"version\":2,\"hosts\":{},\"homes\":{}}' > /root/flake/pins.json")
+                machine.succeed("cd /root/flake && nix flake lock")
+                machine.succeed("systemctl start eppur-upgrade.service")
+                machine.succeed("test \"$(cat /etc/eppur-next)\" = next")
+                machine.succeed("test \"$(readlink -f /run/current-system)\" = \"$(readlink -f ${next})\"")
+                machine.succeed("test \"$(readlink -f /nix/var/nix/profiles/system)\" = \"$(readlink -f ${next})\"")
+                machine.succeed("systemctl start eppur-upgrade.service")
+                machine.succeed("journalctl -u eppur-upgrade.service | grep -F 'already running'")
+              '';
+          };
           home-module =
             assert failedAssertions home.config == [ ];
             assert home.config.programs.eppur.name == "alice";
@@ -430,6 +518,8 @@
             assert homeSettings.kind == "home";
             assert homeSettings.self == "alice";
             assert homeSettings.homes == [ "alice" ];
+            assert homeSettings.nixArgs == [ ];
+            assert homeSettings.evalJobs == 4;
             assert builtins.length home.config.nixpkgs.overlays == 1;
             assert home.config.programs.eppur.packageSets ? nixpkgs;
             assert builtins.match ".*eppur switch --no-commit --timeout 12h --update" homeUpgrade.Service.ExecStart != null;

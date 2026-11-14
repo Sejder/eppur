@@ -107,6 +107,23 @@ in
     default = true;
     description = "When nixpkgs starts refusing a package as insecure, pin it to the copy this machine already built, or when there is none to a donor's copy nixpkgs does not refuse, so the rest of the host still updates; the pin is marked insecure in status and warned about on every run. false holds the host instead, as nixpkgs' refusal intends, until the package is fixed, removed, or allowed with nixpkgs.config.permittedInsecurePackages.";
   };
+  nixArgs = mkOption {
+    type = types.listOf types.str;
+    default = [ ];
+    example = [
+      "--max-jobs"
+      "2"
+      "--option"
+      "builders-use-substitutes"
+      "true"
+    ];
+    description = "Extra arguments for every nix command eppur runs, such as --max-jobs, --builders or --option NAME VALUE, one list element per argument; --nix-arg adds to them.";
+  };
+  evalJobs = mkOption {
+    type = types.ints.positive;
+    default = 4;
+    description = "How many evaluations eppur runs at once; each holds a whole system in memory, so lower it on a small machine.";
+  };
   switcher = mkOption {
     type = types.enum [
       "nh"

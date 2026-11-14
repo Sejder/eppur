@@ -85,6 +85,27 @@ pub struct Pin {
 }
 
 impl Pin {
+    /// A pin with nothing but what every pin has; the rest is filled in by
+    /// the caller as it applies.
+    pub fn new(locked: Value, since: String, reason: Reason, checked_nar_hash: String) -> Self {
+        Self {
+            locked,
+            since,
+            reason,
+            failed_drv: None,
+            trail: Vec::new(),
+            error: None,
+            overlays: None,
+            checked_nar_hash,
+            root_drv: None,
+            tried: None,
+            donor: None,
+            leaf: false,
+            version: None,
+            insecure: false,
+        }
+    }
+
     /// Whether two pins came from one failure: the same package failing the
     /// same way, pinned in several package sets that provide it.
     pub fn same_failure(&self, other: &Pin) -> bool {

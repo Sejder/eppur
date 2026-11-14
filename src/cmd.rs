@@ -11,6 +11,7 @@ use crate::pins::{Kind, Pin, PinsFile, Reason};
 use crate::state;
 use anyhow::{Context, Result, anyhow, bail};
 use std::collections::BTreeSet;
+use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
@@ -113,6 +114,12 @@ pub struct BuildArgs {
     #[arg(long, help_heading = "Fleet options")]
     pub fail_on_hold: bool,
 
+    /// Print what the run did as one JSON object on stdout (pinned, unpinned,
+    /// held, released, built, the exit code and what it means); the log stays
+    /// on stderr, and the switcher's own output moves there too.
+    #[arg(long, help_heading = "Output")]
+    pub json: bool,
+
     /// The lock to pin back to; by default the one each target last built with.
     #[arg(long, value_name = "FILE", help_heading = "Tuning")]
     pub old_lock: Option<PathBuf>,
@@ -133,6 +140,25 @@ pub struct BuildArgs {
     /// 45min or 90s; activation afterwards is not cut short.
     #[arg(long, value_name = "DURATION", value_parser = parse_duration, help_heading = "Tuning")]
     pub timeout: Option<std::time::Duration>,
+    /// An extra argument for every nix command, such as --max-jobs, --builders
+    /// or --option, which takes its value as the next --nix-arg; repeatable.
+    /// Added after programs.eppur.nixArgs.
+    #[arg(
+        long = "nix-arg",
+        value_name = "ARG",
+        allow_hyphen_values = true,
+        help_heading = "Tuning"
+    )]
+    pub nix_args: Vec<String>,
+    /// How many evaluations run at once (default: programs.eppur.evalJobs,
+    /// which is 4); each holds a whole system in memory.
+    #[arg(
+        long,
+        value_name = "N",
+        value_parser = clap::value_parser!(u32).range(1..),
+        help_heading = "Tuning"
+    )]
+    pub eval_jobs: Option<u32>,
     /// The system for eval checks when a target's own cannot be evaluated.
     #[arg(long, value_name = "SYSTEM", default_value_t = default_system(), help_heading = "Tuning")]
     pub system: String,
@@ -196,6 +222,9 @@ impl Ctx {
             ),
             (None, None) => (std::env::current_dir()?, "the current directory".into()),
         };
+        if let Some(c) = &config {
+            nix::configure(c.nix_args.clone(), c.eval_jobs);
+        }
         let flake = match flake.canonicalize() {
             Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => bail!(
@@ -352,9 +381,10 @@ fn activate(
     built: Option<&str>,
     how: Activation,
     switcher: &str,
-) -> Result<ExitCode> {
+    json: bool,
+) -> Result<u8> {
     let verb = match (how, target.kind) {
-        (Activation::None, _) => return Ok(ExitCode::SUCCESS),
+        (Activation::None, _) => return Ok(0),
         (Activation::Switch, _) => "switch",
         (Activation::Boot, Kind::Nixos) => "boot",
         (Activation::Boot, Kind::Home) => {
@@ -396,16 +426,21 @@ fn activate(
             "switching"
         }
     ));
+    if json {
+        cmd.stdout(std::process::Stdio::from(
+            std::io::stderr().as_fd().try_clone_to_owned()?,
+        ));
+    }
     let status = cmd
         .status()
         .with_context(|| format!("running {program}; is it installed?"))?;
     if status.success() {
-        return Ok(ExitCode::SUCCESS);
+        return Ok(0);
     }
     log::warn(&format!(
         "{program} failed ({status}); {target} built, flake.lock and pins.json kept"
     ));
-    Ok(ExitCode::from(4))
+    Ok(4)
 }
 
 /// The file in a --gc-roots directory listing the roots this flake's runs
@@ -583,6 +618,17 @@ enum Closing {
     Committed(String),
 }
 
+impl Closing {
+    fn key(&self) -> &'static str {
+        match self {
+            Closing::NoRepository { .. } => "no-repository",
+            Closing::Unchanged => "unchanged",
+            Closing::Uncommitted => "uncommitted",
+            Closing::Committed(_) => "committed",
+        }
+    }
+}
+
 impl std::fmt::Display for Closing {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -693,11 +739,112 @@ fn run_rolling_back(
     }
 }
 
+/// What a build, switch or boot run did, for `--json`.
+#[derive(Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RunSummary {
+    version: u32,
+    exit: u8,
+    exit_meaning: &'static str,
+    error: Option<String>,
+    dry_run: bool,
+    activation: &'static str,
+    activated: bool,
+    closing: Option<&'static str>,
+    committed: Option<String>,
+    built: Vec<SummaryTarget>,
+    failed: Vec<String>,
+    held_count: usize,
+    pinned: Vec<String>,
+    unpinned: Vec<String>,
+    held: Vec<String>,
+    released: Vec<String>,
+    moved: Vec<String>,
+}
+
+#[derive(serde::Serialize)]
+struct SummaryTarget {
+    kind: &'static str,
+    name: String,
+}
+
+fn exit_meaning(code: u8) -> &'static str {
+    match code {
+        0 => "everything built or was held",
+        1 => "eppur gave up on this machine's own host",
+        2 => "error",
+        3 => "a host or home is held (--fail-on-hold)",
+        4 => "built, but the switcher failed",
+        _ => "unknown",
+    }
+}
+
+impl RunSummary {
+    fn note_report(&mut self, report: &engine::Report) {
+        for (target, _) in &report.built {
+            self.built.push(SummaryTarget {
+                kind: target.kind.noun(),
+                name: target.name.clone(),
+            });
+        }
+        self.failed = report.failed.iter().map(Target::to_string).collect();
+        self.held_count = report.held;
+        for change in &report.changes {
+            let (list, what) = match change {
+                Change::Pinned(w) => (&mut self.pinned, w),
+                Change::Unpinned(w) => (&mut self.unpinned, w),
+                Change::Held(w) => (&mut self.held, w),
+                Change::Released(w) => (&mut self.released, w),
+                Change::Moved(w) => (&mut self.moved, w),
+            };
+            list.push(what.clone());
+        }
+    }
+}
+
 pub fn reconcile(at: &Where, args: &BuildArgs, how: Activation) -> Result<ExitCode> {
+    let mut summary = RunSummary {
+        version: 1,
+        dry_run: args.dry_run,
+        activation: match how {
+            Activation::None => "none",
+            Activation::Switch => "switch",
+            Activation::Boot => "boot",
+        },
+        ..Default::default()
+    };
+    let result = reconcile_run(at, args, how, &mut summary);
+    if args.json {
+        match &result {
+            Ok(code) => summary.exit = *code,
+            Err(e) => {
+                summary.exit = 2;
+                summary.error = Some(format!("{e:#}"));
+            }
+        }
+        summary.exit_meaning = exit_meaning(summary.exit);
+        let mut out = std::io::stdout().lock();
+        let _ = serde_json::to_writer_pretty(&mut out, &summary);
+        let _ = std::io::Write::write_all(&mut out, b"\n");
+    }
+    result.map(ExitCode::from)
+}
+
+fn reconcile_run(
+    at: &Where,
+    args: &BuildArgs,
+    how: Activation,
+    summary: &mut RunSummary,
+) -> Result<u8> {
     let update = args.update.as_deref();
     let ctx = Ctx::open(at, true)?;
     let cfg = ctx.config.clone().expect("config required");
     ctx.announce();
+    nix::configure(
+        cfg.nix_args.iter().chain(&args.nix_args).cloned().collect(),
+        args.eval_jobs.map_or(cfg.eval_jobs, |n| n as usize),
+    );
+    nix::check_extra_args()?;
     let mut targets = cfg.targets();
     // --only NAME, or host:NAME / home:NAME where a host and a home share it.
     let wanted = |t: &Target, n: &str| match n.split_once(':') {
@@ -894,20 +1041,21 @@ pub fn reconcile(at: &Where, args: &BuildArgs, how: Activation) -> Result<ExitCo
     log::set_dry_run(false);
     guard::built();
     let (engine, report) = result?;
+    summary.note_report(&report);
 
     if report.local_failure.is_some() {
         guard::restore()?;
         log::change("nothing committed or activated");
-        return Ok(ExitCode::from(1));
+        return Ok(1);
     }
 
     if args.dry_run {
         guard::restore_quietly()?;
         log::change(&format!("dry run: {}", tally(&report.changes)));
         if args.fail_on_hold && report.held > 0 {
-            return Ok(ExitCode::from(3));
+            return Ok(3);
         }
-        return Ok(ExitCode::SUCCESS);
+        return Ok(0);
     }
 
     // From here the run's results stand or fall together: any error before
@@ -961,6 +1109,10 @@ pub fn reconcile(at: &Where, args: &BuildArgs, how: Activation) -> Result<ExitCo
         })
     })();
     let closing = settled?;
+    summary.closing = Some(closing.key());
+    if let Closing::Committed(what) = &closing {
+        summary.committed = Some(what.clone());
+    }
     let done = format!(
         "done: {} built, {}; {closing}",
         report.built.len(),
@@ -1001,20 +1153,29 @@ pub fn reconcile(at: &Where, args: &BuildArgs, how: Activation) -> Result<ExitCo
             if how != Activation::None {
                 log::warn(&format!("not activating: {target} is held"));
             }
-            ExitCode::SUCCESS
+            0
         }
-        Some(target) => activate(target, &ctx.flake, built.as_deref(), how, &cfg.switcher)?,
+        Some(target) => activate(
+            target,
+            &ctx.flake,
+            built.as_deref(),
+            how,
+            &cfg.switcher,
+            args.json,
+        )?,
         None if how != Activation::None => {
             log::warn(&format!(
                 "not activating: {} was not built in this run",
                 cfg.local()
             ));
-            ExitCode::SUCCESS
+            0
         }
-        None => ExitCode::SUCCESS,
+        None => 0,
     };
-    if args.fail_on_hold && report.held > 0 && code == ExitCode::SUCCESS {
-        return Ok(ExitCode::from(3));
+    summary.activated =
+        how != Activation::None && code == 0 && local.is_some() && !report.local_held;
+    if args.fail_on_hold && report.held > 0 && code == 0 {
+        return Ok(3);
     }
     Ok(code)
 }
@@ -1477,26 +1638,9 @@ pub fn pin(
             old.since
         ));
     }
-    entry.insert(
-        input,
-        attr,
-        Pin {
-            locked,
-            since: date::format(date::today()),
-            reason: Reason::Manual,
-            failed_drv: None,
-            trail: Vec::new(),
-            error: None,
-            overlays,
-            checked_nar_hash: checked,
-            root_drv: None,
-            tried: None,
-            donor: None,
-            leaf: false,
-            version: None,
-            insecure: false,
-        },
-    );
+    let mut pin = Pin::new(locked, date::format(date::today()), Reason::Manual, checked);
+    pin.overlays = overlays;
+    entry.insert(input, attr, pin);
     file.save(&pins_path)?;
     log::change(&format!(
         "pinned {target}: {attr} ({input}) at {at_rev} by hand"

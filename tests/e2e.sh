@@ -1775,4 +1775,42 @@ expect_log "unpinned input exta"
 if eppur_ clear --flake-input exta; then fail "clearing an input that is not pinned succeeded"; fi
 git -C "$sys" checkout -q -- pins.json
 
+step "--nix-arg and nixArgs: a flag nix takes is passed on, one it refuses stops the run before anything is held"
+eppur_ build --no-commit --nix-arg --max-jobs --nix-arg 1 --eval-jobs 1 || fail "build with --nix-arg --max-jobs 1 gave up"
+pins_before="$(cat "$sys/pins.json")"
+rc=0; eppur_ build --no-commit --nix-arg --no-such-nix-flag || rc=$?
+[ "$rc" = 2 ] || fail "a nix flag nix does not know exited with $rc, not 2"
+expect_log "no-such-nix-flag"
+[ "$(cat "$sys/pins.json")" = "$pins_before" ] || fail "a refused --nix-arg changed pins.json"
+COMMIT=false write_config "" '"input": "toypkgs", "inputDeny": ["*"], "nixArgs": ["--no-such-nix-flag"], "evalJobs": 2' '"b"'
+rc=0; eppur_ build --no-commit || rc=$?
+[ "$rc" = 2 ] || fail "nixArgs nix refuses exited with $rc, not 2"
+expect_log "no-such-nix-flag"
+[ "$(cat "$sys/pins.json")" = "$pins_before" ] || fail "refused nixArgs changed pins.json"
+git -C "$sys" checkout -q -- flake.lock pins.json
+
+step "--json: one report on stdout, the log stays on stderr"
+COMMIT=false write_config "" '"input": "toypkgs", "inputDeny": ["*"]' '"b"'
+revision fixed false 201 ok
+json_report() { nix eval --raw --impure --expr "let j = builtins.fromJSON (builtins.readFile $work/json); in $1"; }
+"$eppur" build --json --no-commit --update --config "$config" >"$work/json" 2>"$log" || fail "build --json gave up"
+[ "$(json_report 'toString j.version')" = 1 ] || fail "json: version is not 1: $(cat "$work/json")"
+[ "$(json_report 'toString j.exit')" = 0 ] || fail "json: exit is not 0"
+[ "$(json_report 'j.exitMeaning')" = "everything built or was held" ] || fail "json: exitMeaning"
+[ "$(json_report 'j.activation')" = none ] || fail "json: activation"
+[ "$(json_report 'builtins.concatStringsSep "," (map (t: t.kind + ":" + t.name) j.built)')" = "host:b" ] || fail "json: built: $(cat "$work/json")"
+[ "$(json_report 'toString (builtins.length j.pinned)')" = 0 ] || fail "json: pinned something"
+expect_log "round 1: evaluating and building host b"
+revision fixed false broken ok
+"$eppur" build --json --no-commit --update --config "$config" >"$work/json" 2>"$log" || fail "build --json with a pin gave up"
+[ "$(json_report 'toString (builtins.length j.pinned)')" = 1 ] || fail "json: pinned: $(cat "$work/json")"
+case "$(json_report 'builtins.head j.pinned')" in "host b: hello (toypkgs)"*) ;; *) fail "json: pinned entry: $(cat "$work/json")" ;; esac
+[ "$(json_report 'j.closing')" = uncommitted ] || fail "json: closing: $(cat "$work/json")"
+"$eppur" build --json --no-commit --dry-run --config "$config" >"$work/json" 2>"$log" || fail "build --json --dry-run gave up"
+[ "$(json_report 'if j.dryRun then "yes" else "no"')" = yes ] || fail "json: dryRun"
+"$eppur" build --json --only nosuch --config "$config" >"$work/json" 2>"$log" && fail "build --json --only nosuch succeeded"
+[ "$(json_report 'toString j.exit')" = 2 ] || fail "json: exit of an error is not 2"
+case "$(json_report 'j.error')" in *nosuch*) ;; *) fail "json: error: $(cat "$work/json")" ;; esac
+git -C "$sys" checkout -q -- flake.lock pins.json
+
 printf '\nall e2e steps passed\n'

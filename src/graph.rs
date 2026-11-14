@@ -38,6 +38,10 @@ struct DrvJson {
     name: Option<String>,
     #[serde(default)]
     env: EnvJson,
+    #[serde(default, rename = "structuredAttrs")]
+    structured_attrs: Option<AttrsJson>,
+    #[serde(default)]
+    outputs: Option<HashMap<String, OutputJson>>,
     #[serde(default)]
     inputs: Option<InputsJson>,
     #[serde(default, rename = "inputDrvs")]
@@ -54,6 +58,27 @@ struct EnvJson {
     pname: Option<String>,
     #[serde(default, rename = "outputHash")]
     output_hash: Option<String>,
+    #[serde(default, rename = "__json")]
+    json: Option<String>,
+}
+
+/// The attributes of a derivation built with structured attrs, which `nix
+/// derivation show` prints as an object (or, in older layouts, as the JSON
+/// string in `env.__json`).
+#[derive(Deserialize, Default)]
+struct AttrsJson {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    pname: Option<String>,
+    #[serde(default, rename = "outputHash")]
+    output_hash: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize, Default)]
+struct OutputJson {
+    #[serde(default)]
+    hash: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -99,12 +124,27 @@ impl Graph {
                 (None, Some(i)) => (i.into_keys().collect(), drv.input_srcs.unwrap_or_default()),
                 (None, None) => (Vec::new(), drv.input_srcs.unwrap_or_default()),
             };
+            let attrs = drv
+                .structured_attrs
+                .or_else(|| {
+                    drv.env
+                        .json
+                        .as_deref()
+                        .and_then(|j| serde_json::from_str::<AttrsJson>(j).ok())
+                })
+                .unwrap_or_default();
+            let fixed_output = drv
+                .outputs
+                .as_ref()
+                .is_some_and(|o| o.values().any(|o| o.hash.is_some()))
+                || drv.env.output_hash.is_some()
+                || attrs.output_hash.is_some();
             let node = Node {
-                name: drv.name.or(drv.env.name).unwrap_or_default(),
-                pname: drv.env.pname,
+                name: drv.name.or(drv.env.name).or(attrs.name).unwrap_or_default(),
+                pname: drv.env.pname.or(attrs.pname),
                 inputs: inputs.into_iter().map(|i| full_path(store, i)).collect(),
                 parents: Vec::new(),
-                fixed_output: drv.env.output_hash.is_some(),
+                fixed_output,
                 srcs: srcs.into_iter().map(|p| full_path(store, p)).collect(),
             };
             graph.nodes.insert(full_path(store, path), node);
@@ -308,6 +348,45 @@ mod tests {
         assert_eq!(obs.pname.as_deref(), Some("obs-studio"));
         assert_eq!(obs.parents, vec![s("sp-system-path.drv")]);
         assert_eq!(g.nodes[&s("l-libfoo-1.drv")].parents.len(), 2);
+    }
+
+    #[test]
+    fn structured_attrs_carry_pname_and_fixed_output() {
+        let g = parse(serde_json::json!({
+            "version": 4,
+            "derivations": {
+                "p-hello-2.12.drv": { "name": "hello-2.12", "env": { "out": "/nix/store/x-hello-2.12" },
+                    "outputs": { "out": { "path": "x-hello-2.12" } },
+                    "structuredAttrs": { "pname": "hello", "version": "2.12", "env": {} },
+                    "inputs": { "drvs": { "f-hello-2.12.tar.gz.drv": { "outputs": ["out"] }, "c-stdenv-linux.drv": {} }, "srcs": [] } },
+                "f-hello-2.12.tar.gz.drv": { "name": "hello-2.12.tar.gz", "env": { "out": "/nix/store/y-hello-2.12.tar.gz" },
+                    "outputs": { "out": { "hash": "sha256-AAAA", "method": "flat" } },
+                    "structuredAttrs": { "pname": "hello-tar", "urls": [] },
+                    "inputs": { "drvs": {}, "srcs": [] } },
+                "c-stdenv-linux.drv": { "name": "stdenv-linux", "env": { "pname": "stdenv-linux", "out": "/nix/store/z-stdenv-linux" },
+                    "outputs": { "out": { "path": "z-stdenv-linux" } }, "structuredAttrs": null,
+                    "inputs": { "drvs": {}, "srcs": [] } },
+                "o-old-fetch.drv": { "name": "old-fetch", "env": { "outputHash": "sha256-BBBB", "pname": "old" },
+                    "outputs": { "out": { "path": "w-old" } }, "structuredAttrs": null,
+                    "inputs": { "drvs": {} } },
+                "j-json.drv": { "name": "json-1", "env": { "__json": "{\"pname\":\"jsonpkg\",\"outputHash\":\"sha256-CCCC\"}" },
+                    "inputs": { "drvs": {} } }
+            }
+        }));
+        let hello = &g.nodes[&s("p-hello-2.12.drv")];
+        assert_eq!(hello.pname.as_deref(), Some("hello"));
+        assert!(!hello.fixed_output);
+        assert!(g.is_package(&s("p-hello-2.12.drv")));
+        let fetch = &g.nodes[&s("f-hello-2.12.tar.gz.drv")];
+        assert!(fetch.fixed_output);
+        assert!(!g.is_package(&s("f-hello-2.12.tar.gz.drv")));
+        let classic = &g.nodes[&s("c-stdenv-linux.drv")];
+        assert_eq!(classic.pname.as_deref(), Some("stdenv-linux"));
+        assert!(!classic.fixed_output);
+        assert!(g.nodes[&s("o-old-fetch.drv")].fixed_output);
+        let json = &g.nodes[&s("j-json.drv")];
+        assert_eq!(json.pname.as_deref(), Some("jsonpkg"));
+        assert!(json.fixed_output);
     }
 
     #[test]

@@ -183,6 +183,8 @@ in
           inputDeny
           retrySameDerivationAfterDays
           pinInsecure
+          nixArgs
+          evalJobs
           ;
         packageSets = builtins.attrNames cfg.nixpkgs;
       };

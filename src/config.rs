@@ -53,6 +53,17 @@ pub struct Config {
     /// already built, instead of holding the host.
     #[serde(default = "default_true")]
     pub pin_insecure: bool,
+    /// Extra arguments for every nix command, such as --max-jobs 2 or
+    /// --option NAME VALUE.
+    #[serde(default)]
+    pub nix_args: Vec<String>,
+    /// How many evaluations run at once.
+    #[serde(default = "default_eval_jobs")]
+    pub eval_jobs: usize,
+}
+
+fn default_eval_jobs() -> usize {
+    crate::nix::DEFAULT_EVAL_JOBS
 }
 
 fn default_true() -> bool {
@@ -225,6 +236,18 @@ mod tests {
         assert_eq!(c.warn_after_days, 14);
         assert!(c.targets().is_empty());
         assert!(c.flake.is_none());
+        assert!(c.nix_args.is_empty());
+        assert_eq!(c.eval_jobs, 4);
+    }
+
+    #[test]
+    fn parses_nix_args_and_eval_jobs() {
+        let c = Config::parse(
+            br#"{"kind":"home","self":"alice","nixArgs":["--max-jobs","2"],"evalJobs":1}"#,
+        )
+        .unwrap();
+        assert_eq!(c.nix_args, ["--max-jobs", "2"]);
+        assert_eq!(c.eval_jobs, 1);
     }
 
     #[test]

@@ -2,6 +2,39 @@
 
 ## Unreleased
 
+- Most derivations on current nixpkgs use structured attributes, which `nix
+  derivation show` prints outside `env`, and eppur read `pname` and
+  `outputHash` only from `env`. On a real system it saw 246 of 8285 downloads
+  and 3732 of 5933 packages. A failed download was therefore pinned as a
+  broken package instead of being built once more, and the guard against
+  pinning a library that many packages depend on, and the check that no
+  package depends on one before a donor's copy replaces it, counted too few
+  dependents, mostly those in nested sets such as `python3Packages`. The
+  name is now read from `env`, then the structured attributes (also the
+  `env.__json` of older Nix), and a download is recognised by an output with
+  a fixed hash. With the full count, a failure in a package that more than 25
+  others depend on now holds the host where it was pinned before.
+- `programs.eppur.nixArgs` and `--nix-arg ARG` (repeatable) pass extra
+  arguments to the nix commands of a build, switch or boot run. They go
+  before nix's subcommand, so they are global settings such as `--max-jobs`,
+  `--builders` or `--option NAME VALUE`; one nix refuses there stops the run
+  with an error before anything builds. The switcher does not get them.
+  `programs.eppur.evalJobs` and `--eval-jobs N` set how many evaluations run
+  at once (4, as before).
+- After a failed build, eppur dumped the whole derivation graph of every host
+  it had built, including the hosts that built, which for a fleet is the
+  heaviest call of a round (76 MB of JSON for one host). Only the hosts that
+  did not build are dumped now.
+- Looking up whether a package is available from a substituter asked each
+  substituter one after the other; they are asked at the same time now.
+- `build`, `switch` and `boot` take `--json`: one JSON object on stdout with
+  what the run pinned, unpinned, held, released and built, the exit code and
+  what it means (see the README). The log stays on stderr, and so does the
+  output of the switcher and of nix-output-monitor, which used to go to stdout.
+- CI runs the end-to-end suite on Nix 2.19, 2.24 and the current release,
+  and a NixOS VM test (x86_64-linux) checks that the
+  `programs.eppur.autoUpgrade` service builds and activates.
+
 - A package nixpkgs newly refuses as insecure held the whole host, although
   the host already ran that same vulnerable copy: the hold did not remove the
   vulnerability, and it kept every other package old, security fixes included.

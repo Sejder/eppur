@@ -6,7 +6,7 @@ use crate::inputs::{self, Rollback};
 use crate::lock::Lock;
 use crate::log;
 use crate::logparse::{self, Failure};
-use crate::nix::{Monitor, Nix};
+use crate::nix::{BuildOutcome, Monitor, Nix};
 use crate::pins::{Entry, Held, Kind, Pin, PinsFile, Reason};
 use crate::resolve::{self, Matcher};
 use anyhow::{Result, bail};
@@ -179,6 +179,101 @@ struct Wanted {
     /// The packages nixpkgs refused, by name and version, which a donor's
     /// copy must not bring along.
     refused: Vec<String>,
+}
+
+impl Wanted {
+    /// The pin for this failure at `locked`; a donor's copy is no leaf, since
+    /// a donor may only replace a package nothing depends on.
+    fn new_pin(
+        &self,
+        locked: Value,
+        since: String,
+        checked: String,
+        overlays: Option<bool>,
+        donor: Option<String>,
+    ) -> Pin {
+        let mut pin = Pin::new(locked, since, self.reason, checked);
+        pin.failed_drv = self.failed_drv.clone();
+        pin.trail = self.trail.clone();
+        pin.error = self.error.clone();
+        pin.overlays = overlays;
+        pin.root_drv = self.root_drv.clone();
+        pin.leaf = self.leaf && donor.is_none();
+        pin.insecure = self.insecure;
+        pin.donor = donor;
+        pin
+    }
+
+    /// An existing pin that failed again, as this failure reports it. The
+    /// date it was made and, unless this failure names a package, what it
+    /// recorded about the failure, stay.
+    fn refresh_retried(&self, mut pin: Pin, checked: String, today: &str) -> Pin {
+        pin.checked_nar_hash = checked;
+        if self.failed_drv.is_some() || self.error.is_some() {
+            pin.failed_drv = self.failed_drv.clone();
+            pin.trail = self.trail.clone();
+            pin.error = self.error.clone();
+        }
+        pin.insecure = self.insecure;
+        if self.root_drv.is_some() {
+            pin.root_drv = self.root_drv.clone();
+            pin.leaf = self.leaf;
+            pin.tried = Some(today.to_string());
+        }
+        pin
+    }
+
+    /// The pin this target built with last time, now that it fails again:
+    /// the same revision, with this failure's record.
+    fn reuse_good(&self, mut pin: Pin, checked: String) -> Pin {
+        pin.checked_nar_hash = checked;
+        pin.failed_drv = self.failed_drv.clone();
+        pin.trail = self.trail.clone();
+        pin.error = self.error.clone();
+        pin.root_drv = self.root_drv.clone();
+        pin.leaf = self.leaf;
+        pin.tried = None;
+        pin.insecure = self.insecure;
+        pin
+    }
+}
+
+/// What a failure pinned in several package sets reports: "NAME ... at REV"
+/// with one revision for all sets when they agree, else each its own.
+fn describe_added(added: &[(String, String, Pin)]) -> String {
+    let revs: BTreeSet<String> = added
+        .iter()
+        .map(|(_, _, p)| describe_dated(&p.locked))
+        .collect();
+    if revs.len() == 1 {
+        format!(
+            "({}) at {}",
+            added
+                .iter()
+                .map(|(i, _, _)| i.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+            describe_dated(&added[0].2.locked)
+        )
+    } else {
+        format!(
+            "({})",
+            added
+                .iter()
+                .map(|(i, _, p)| format!("{i} at {}", describe_dated(&p.locked)))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+}
+
+/// Why a failure could not be pinned in any package set.
+fn describe_skipped(skipped: &[(String, String, String)]) -> String {
+    skipped
+        .iter()
+        .map(|(a, i, why)| format!("{a} ({i}) fails: {why}"))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 /// A pin to a donor's copy of a package nixpkgs refuses as insecure, made
@@ -1105,7 +1200,9 @@ impl Engine {
         };
         monitor.finish();
         let graph = match &outcome {
-            Some(o) if !o.success => Some(self.nix.show_drvs(&drvs)?),
+            Some(o) if !o.success => Some(self.nix.show_drvs(&to_show(&drvs, |d| {
+                crate::nix::is_built(d).unwrap_or(false)
+            }))?),
             _ => None,
         };
 
@@ -1124,19 +1221,13 @@ impl Engine {
                 log::info("a download or a killed builder failed; building once more");
                 let mut monitor = Monitor::start();
                 let retried = self.nix.build_drvs(&transient, &mut monitor)?;
-                let named = logparse::failed_drvs(&retried.errors);
-                // Failed without naming a derivation: the retry says nothing.
-                if retried.success || !named.is_empty() {
-                    let others = logparse::parse(&first.errors).into_iter().any(|f| match f {
-                        Failure::Build { drv } | Failure::Infra { drv, .. } => {
-                            !transient.contains(&drv)
-                        }
-                        _ => false,
-                    });
-                    if (others || !retried.success) && !last_round {
+                match judge_retry(&first.errors, &transient, &retried, last_round) {
+                    RetryVerdict::Unclear => {}
+                    RetryVerdict::Replace => {
                         retried_drvs.extend(transient);
                         retry_errors = retried.errors;
-                    } else {
+                    }
+                    RetryVerdict::RebuildAll => {
                         outcome = Some(self.nix.build_drvs(&drvs, &mut monitor)?);
                     }
                 }
@@ -1154,21 +1245,11 @@ impl Engine {
                     states[*i].drv = Some(drv.clone());
                 }
             } else {
-                let superseded = |f: &Failure| match f {
-                    Failure::Build { drv } | Failure::Infra { drv, .. } => {
-                        retried_drvs.contains(drv)
-                    }
-                    _ => false,
-                };
-                let parsed: Vec<Failure> = logparse::parse(&outcome.errors)
-                    .into_iter()
-                    .filter(|f| !superseded(f))
-                    .chain(logparse::parse(&retry_errors))
-                    .collect();
-                let infra: Vec<(&String, &String)> = parsed
+                let parsed = failures_after_retry(&outcome.errors, &retried_drvs, &retry_errors);
+                let infra: Vec<(String, String)> = parsed
                     .iter()
                     .filter_map(|f| match f {
-                        Failure::Infra { drv, reason } => Some((drv, reason)),
+                        Failure::Infra { drv, reason } => Some((drv.clone(), reason.clone())),
                         _ => None,
                     })
                     .collect();
@@ -1183,9 +1264,10 @@ impl Engine {
                 let mut not_built = logparse::failed_drvs(&outcome.errors);
                 not_built.extend(logparse::failed_drvs(&retry_errors));
                 let again = logparse::failed_drvs(&retry_errors);
-                let recovered: Vec<&String> = retried_drvs
+                let recovered: Vec<String> = retried_drvs
                     .iter()
                     .filter(|d| !again.contains(*d))
+                    .cloned()
                     .collect();
                 let why = outcome
                     .errors
@@ -1202,28 +1284,31 @@ impl Engine {
                 }
                 for (i, top) in &built {
                     let closure = graph.closure(top);
-                    let mine: Vec<&String> =
-                        failed.iter().filter(|d| closure.contains(*d)).collect();
                     let st = &mut states[*i];
-                    let own_build_failed = closure.iter().any(|d| not_built.contains(d));
-                    // A build that cannot run here (another platform, no
-                    // builder, out of memory) is this machine's problem, not
-                    // the package's: the host waits for it, without a pin.
-                    if let Some((drv, reason)) = infra.iter().find(|(d, _)| closure.contains(*d)) {
-                        st.status = Status::Failed(format!(
-                            "{} could not run on this machine ({reason})",
-                            graph.display_name(drv)
-                        ));
-                    } else if mine.is_empty() && recovered.iter().any(|d| closure.contains(*d)) {
-                        // Only held up by what recovered: the next round builds it.
-                    } else if mine.is_empty() && (own_build_failed || !crate::nix::is_built(top)?) {
-                        st.status = Status::Failed(format!("its system did not build: {why}"));
-                    } else if mine.is_empty() {
-                        st.status = Status::Done;
-                        st.drv = Some(top.clone());
-                    } else {
-                        let wanted = self.build_wanted(&graph, &closure, &mine, st)?;
-                        self.apply(st, wanted);
+                    let verdict =
+                        classify_host(&closure, &failed, &infra, &not_built, &recovered, || {
+                            crate::nix::is_built(top)
+                        })?;
+                    match verdict {
+                        HostBuild::Infra { drv, reason } => {
+                            st.status = Status::Failed(format!(
+                                "{} could not run on this machine ({reason})",
+                                graph.display_name(&drv)
+                            ));
+                        }
+                        HostBuild::WaitsForRecovered => {}
+                        HostBuild::SystemFailed => {
+                            st.status = Status::Failed(format!("its system did not build: {why}"));
+                        }
+                        HostBuild::Built => {
+                            st.status = Status::Done;
+                            st.drv = Some(top.clone());
+                        }
+                        HostBuild::Broken(mine) => {
+                            let mine: Vec<&String> = mine.iter().collect();
+                            let wanted = self.build_wanted(&graph, &closure, &mine, st)?;
+                            self.apply(st, wanted);
+                        }
                     }
                 }
             }
@@ -1625,7 +1710,7 @@ impl Engine {
                     ));
                     continue;
                 };
-                if let Some(mut pin) = st.retrying.remove(&(input.clone(), attr.clone())) {
+                if let Some(pin) = st.retrying.remove(&(input.clone(), attr.clone())) {
                     if w.insecure && pin.insecure && pin.donor.is_some() {
                         match self.refused_donor_pin(st, input, attr, &w, checked) {
                             Some(again) => {
@@ -1640,18 +1725,7 @@ impl Engine {
                         }
                         continue;
                     }
-                    pin.checked_nar_hash = checked;
-                    if w.failed_drv.is_some() || w.error.is_some() {
-                        pin.failed_drv = w.failed_drv.clone();
-                        pin.trail = w.trail.clone();
-                        pin.error = w.error.clone();
-                    }
-                    pin.insecure = w.insecure;
-                    if w.root_drv.is_some() {
-                        pin.root_drv = w.root_drv.clone();
-                        pin.leaf = w.leaf;
-                        pin.tried = Some(date::format(self.today));
-                    }
+                    let pin = w.refresh_retried(pin, checked, &date::format(self.today));
                     kept.push(format!("{input} (since {})", pin.since));
                     let pin = self.with_donor(st, input, attr, pin, true);
                     let pin = self.versioned(st, attr, pin);
@@ -1673,21 +1747,14 @@ impl Engine {
                 // known to work, whatever the last good lock itself says (the
                 // package may have been broken there too, and built only
                 // because of this pin).
-                if let Some(mut pin) = st
+                if let Some(pin) = st
                     .good_pins
                     .as_ref()
                     .and_then(|e| e.get(input, attr))
                     .filter(|p| p.reason != Reason::Manual)
                     .cloned()
                 {
-                    pin.checked_nar_hash = checked;
-                    pin.failed_drv = w.failed_drv.clone();
-                    pin.trail = w.trail.clone();
-                    pin.error = w.error.clone();
-                    pin.root_drv = w.root_drv.clone();
-                    pin.leaf = w.leaf;
-                    pin.tried = None;
-                    pin.insecure = w.insecure;
+                    let pin = w.reuse_good(pin, checked);
                     let pin = self.with_donor(st, input, attr, pin, false);
                     let pin = self.versioned(st, attr, pin);
                     added.push((input.clone(), attr.clone(), pin));
@@ -1731,32 +1798,13 @@ impl Engine {
                     ));
                     continue;
                 }
-                let pin = Pin {
-                    locked,
-                    since: date::format(self.today),
-                    reason: w.reason,
-                    failed_drv: w.failed_drv.clone(),
-                    trail: w.trail.clone(),
-                    error: w.error.clone(),
-                    overlays,
-                    checked_nar_hash: checked,
-                    root_drv: w.root_drv.clone(),
-                    tried: None,
-                    donor: None,
-                    leaf: w.leaf,
-                    version: None,
-                    insecure: w.insecure,
-                };
+                let pin = w.new_pin(locked, date::format(self.today), checked, overlays, None);
                 let pin = self.with_donor(st, input, attr, pin, false);
                 let pin = self.versioned(st, attr, pin);
                 added.push((input.clone(), attr.clone(), pin));
             }
             if added.is_empty() && kept.is_empty() {
-                return Err(skipped
-                    .iter()
-                    .map(|(a, i, why)| format!("{a} ({i}) fails: {why}"))
-                    .collect::<Vec<_>>()
-                    .join("; "));
+                return Err(describe_skipped(&skipped));
             }
             let attrs: BTreeSet<&str> = w.members.iter().map(|(_, a)| a.as_str()).collect();
             let name = attrs.into_iter().collect::<Vec<_>>().join(", ");
@@ -1776,31 +1824,7 @@ impl Engine {
                         self.max_new_pins
                     ));
                 }
-                // One revision for all sets when they agree, else each its own.
-                let revs: BTreeSet<String> = added
-                    .iter()
-                    .map(|(_, _, p)| describe_dated(&p.locked))
-                    .collect();
-                let sets = if revs.len() == 1 {
-                    format!(
-                        "({}) at {}",
-                        added
-                            .iter()
-                            .map(|(i, _, _)| i.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", "),
-                        describe_dated(&added[0].2.locked)
-                    )
-                } else {
-                    format!(
-                        "({})",
-                        added
-                            .iter()
-                            .map(|(i, _, p)| format!("{i} at {}", describe_dated(&p.locked)))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )
-                };
+                let sets = describe_added(&added);
                 log::change(&format!("pinned {}: {name} {sets}: {}", st.target, w.cause));
                 for (input, attr, pin) in added {
                     st.entry.insert(&input, &attr, pin);
@@ -1942,22 +1966,15 @@ impl Engine {
             drv: copy.drv.clone(),
             refused: w.refused.clone(),
         });
-        Some(Pin {
+        let mut pin = w.new_pin(
             locked,
-            since: date::format(self.today),
-            reason: w.reason,
-            failed_drv: w.failed_drv.clone(),
-            trail: w.trail.clone(),
-            error: w.error.clone(),
-            overlays: copy.overlays,
-            checked_nar_hash: checked,
-            root_drv: w.root_drv.clone(),
-            tried: None,
-            donor: Some(donor),
-            leaf: false,
-            version: Some(copy.version).filter(|v| !v.is_empty()),
-            insecure: w.insecure,
-        })
+            date::format(self.today),
+            checked,
+            copy.overlays,
+            Some(donor),
+        );
+        pin.version = Some(copy.version).filter(|v| !v.is_empty());
+        Some(pin)
     }
 
     /// Check the donor pins `refused_donor_pin` made against the system they
@@ -2516,6 +2533,121 @@ fn evidence_first(
         .collect()
 }
 
+/// The toplevel drvs whose graph a failed build needs: those that did not
+/// build. A target that built has nothing failed in its closure, and dumping
+/// the recursive graph of a system is by far the heaviest nix call of a round;
+/// when every target built, all are shown, as the build failed somewhere.
+fn to_show(drvs: &[String], built: impl Fn(&str) -> bool) -> Vec<String> {
+    let unbuilt: Vec<String> = drvs.iter().filter(|d| !built(d)).cloned().collect();
+    if unbuilt.is_empty() {
+        drvs.to_vec()
+    } else {
+        unbuilt
+    }
+}
+
+/// What a retry of the transient failures says about the first build.
+#[derive(Debug, PartialEq, Eq)]
+enum RetryVerdict {
+    /// It failed without naming a derivation: it says nothing.
+    Unclear,
+    /// Its result replaces what the first build said about those drvs.
+    Replace,
+    /// Nothing else is left failing, or no later round can retry them: the
+    /// whole build runs again.
+    RebuildAll,
+}
+
+fn judge_retry(
+    first_errors: &[String],
+    transient: &[String],
+    retried: &BuildOutcome,
+    last_round: bool,
+) -> RetryVerdict {
+    if !retried.success && logparse::failed_drvs(&retried.errors).is_empty() {
+        return RetryVerdict::Unclear;
+    }
+    let others = logparse::parse(first_errors).into_iter().any(|f| match f {
+        Failure::Build { drv } | Failure::Infra { drv, .. } => !transient.contains(&drv),
+        _ => false,
+    });
+    if (others || !retried.success) && !last_round {
+        RetryVerdict::Replace
+    } else {
+        RetryVerdict::RebuildAll
+    }
+}
+
+/// The failures of the first build, less those the retry judged again, plus
+/// what the retry itself found.
+fn failures_after_retry(
+    first_errors: &[String],
+    retried: &HashSet<String>,
+    retry_errors: &[String],
+) -> Vec<Failure> {
+    let superseded = |f: &Failure| match f {
+        Failure::Build { drv } | Failure::Infra { drv, .. } => retried.contains(drv),
+        _ => false,
+    };
+    logparse::parse(first_errors)
+        .into_iter()
+        .filter(|f| !superseded(f))
+        .chain(logparse::parse(retry_errors))
+        .collect()
+}
+
+/// What a failed build means for one target.
+#[derive(Debug, PartialEq, Eq)]
+enum HostBuild {
+    /// A build that cannot run here (another platform, no builder, out of
+    /// memory) is this machine's problem, not the package's: the host waits
+    /// for it, without a pin.
+    Infra {
+        drv: String,
+        reason: String,
+    },
+    /// Only held up by what recovered on the retry: the next round builds it.
+    WaitsForRecovered,
+    /// Its system did not build, and no package in it is to blame.
+    SystemFailed,
+    Built,
+    /// These drvs in its closure failed to build.
+    Broken(Vec<String>),
+}
+
+/// Judge one target's closure against the failures of the round. `top_built`
+/// asks the store, and is only called when nothing else decides.
+fn classify_host(
+    closure: &HashSet<String>,
+    failed: &[String],
+    infra: &[(String, String)],
+    not_built: &HashSet<String>,
+    recovered: &[String],
+    top_built: impl FnOnce() -> Result<bool>,
+) -> Result<HostBuild> {
+    if let Some((drv, reason)) = infra.iter().find(|(d, _)| closure.contains(d)) {
+        return Ok(HostBuild::Infra {
+            drv: drv.clone(),
+            reason: reason.clone(),
+        });
+    }
+    let mine: Vec<String> = failed
+        .iter()
+        .filter(|d| closure.contains(*d))
+        .cloned()
+        .collect();
+    if !mine.is_empty() {
+        return Ok(HostBuild::Broken(mine));
+    }
+    if recovered.iter().any(|d| closure.contains(d)) {
+        return Ok(HostBuild::WaitsForRecovered);
+    }
+    if closure.iter().any(|d| not_built.contains(d)) || !top_built()? {
+        return Ok(HostBuild::SystemFailed);
+    }
+    Ok(HostBuild::Built)
+}
+
 /// The failed drvs that may have failed only for the moment: builders killed
 /// by a signal, and downloads (fixed-output derivations) whose builder failed.
 fn transient_drvs(errors: &[String], graph: &Graph) -> Vec<String> {
@@ -2769,6 +2901,236 @@ mod tests {
         );
         let mismatch = "hash mismatch in fixed-output derivation '/nix/store/aaa-src.tar.gz.drv'";
         assert!(transient_drvs(&errors(&[mismatch]), &graph).is_empty());
+    }
+
+    fn errors(m: &[&str]) -> Vec<String> {
+        m.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn outcome(success: bool, m: &[&str]) -> BuildOutcome {
+        BuildOutcome {
+            success,
+            errors: errors(m),
+        }
+    }
+
+    const DOWNLOAD: &str = "builder for '/nix/store/aaa-src.tar.gz.drv' failed with exit code 1";
+    const COMPILE: &str = "builder for '/nix/store/bbb-app-1.0.drv' failed with exit code 1";
+
+    #[test]
+    fn only_targets_that_did_not_build_are_shown() {
+        let drvs = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert_eq!(to_show(&drvs, |d| d == "b"), ["a", "c"]);
+        assert_eq!(to_show(&drvs, |_| true), drvs);
+        assert_eq!(to_show(&drvs, |_| false), drvs);
+    }
+
+    #[test]
+    fn a_retry_that_names_nothing_says_nothing() {
+        let transient = ["/nix/store/aaa-src.tar.gz.drv".to_string()];
+        assert_eq!(
+            judge_retry(
+                &errors(&[DOWNLOAD]),
+                &transient,
+                &outcome(false, &["the daemon went away"]),
+                false
+            ),
+            RetryVerdict::Unclear
+        );
+    }
+
+    #[test]
+    fn a_retry_replaces_the_first_build_only_while_something_else_is_left() {
+        let transient = ["/nix/store/aaa-src.tar.gz.drv".to_string()];
+        let both = errors(&[DOWNLOAD, COMPILE]);
+        assert_eq!(
+            judge_retry(&both, &transient, &outcome(true, &[]), false),
+            RetryVerdict::Replace
+        );
+        assert_eq!(
+            judge_retry(&both, &transient, &outcome(true, &[]), true),
+            RetryVerdict::RebuildAll
+        );
+        let alone = errors(&[DOWNLOAD]);
+        assert_eq!(
+            judge_retry(&alone, &transient, &outcome(true, &[]), false),
+            RetryVerdict::RebuildAll
+        );
+        assert_eq!(
+            judge_retry(&alone, &transient, &outcome(false, &[DOWNLOAD]), false),
+            RetryVerdict::Replace
+        );
+    }
+
+    #[test]
+    fn a_retry_supersedes_what_the_first_build_said_about_its_drvs() {
+        let retried: HashSet<String> = ["/nix/store/aaa-src.tar.gz.drv".to_string()].into();
+        let first = errors(&[DOWNLOAD, COMPILE]);
+        assert_eq!(
+            failures_after_retry(&first, &retried, &[]),
+            [Failure::Build {
+                drv: "/nix/store/bbb-app-1.0.drv".into()
+            }]
+        );
+        let again = errors(&[DOWNLOAD]);
+        assert_eq!(failures_after_retry(&first, &retried, &again).len(), 2);
+        assert_eq!(failures_after_retry(&first, &HashSet::new(), &[]).len(), 2);
+    }
+
+    #[test]
+    fn a_failed_build_is_judged_per_target() {
+        let closure: HashSet<String> = ["top", "lib", "app"].map(String::from).into();
+        let none = HashSet::new();
+        let built = || Ok(true);
+        let unbuilt = || Ok(false);
+        let failed = vec!["app".to_string(), "elsewhere".to_string()];
+        assert_eq!(
+            classify_host(&closure, &failed, &[], &none, &[], built).unwrap(),
+            HostBuild::Broken(vec!["app".into()])
+        );
+        let infra = vec![("lib".to_string(), "timed out".to_string())];
+        assert_eq!(
+            classify_host(&closure, &failed, &infra, &none, &[], built).unwrap(),
+            HostBuild::Infra {
+                drv: "lib".into(),
+                reason: "timed out".into()
+            }
+        );
+        assert_eq!(
+            classify_host(&closure, &[], &[], &none, &["lib".to_string()], built).unwrap(),
+            HostBuild::WaitsForRecovered
+        );
+        let not_built: HashSet<String> = ["lib".to_string()].into();
+        assert_eq!(
+            classify_host(&closure, &[], &[], &not_built, &[], built).unwrap(),
+            HostBuild::SystemFailed
+        );
+        assert_eq!(
+            classify_host(&closure, &[], &[], &none, &[], unbuilt).unwrap(),
+            HostBuild::SystemFailed
+        );
+        assert_eq!(
+            classify_host(&closure, &[], &[], &none, &[], built).unwrap(),
+            HostBuild::Built
+        );
+    }
+
+    #[test]
+    fn the_store_is_only_asked_when_nothing_else_decides() {
+        let closure: HashSet<String> = ["top", "app"].map(String::from).into();
+        let asked = std::cell::Cell::new(false);
+        let ask = || {
+            asked.set(true);
+            Ok(true)
+        };
+        classify_host(
+            &closure,
+            &["app".to_string()],
+            &[],
+            &HashSet::new(),
+            &[],
+            ask,
+        )
+        .unwrap();
+        assert!(!asked.get());
+    }
+
+    fn wanted() -> Wanted {
+        Wanted {
+            members: vec![("nixpkgs".into(), "app".into())],
+            reason: Reason::Build,
+            failed_drv: Some("/nix/store/aaa-lib.drv".into()),
+            root_drv: Some("/nix/store/bbb-app.drv".into()),
+            leaf: true,
+            cause: "lib failed".into(),
+            trail: vec!["lib".into(), "app".into()],
+            error: None,
+            insecure: false,
+            donor_only: false,
+            refused: Vec::new(),
+        }
+    }
+
+    fn locked(rev: &str) -> Value {
+        serde_json::json!({ "type": "github", "rev": rev, "narHash": "sha256-X", "lastModified": 1_700_000_000 })
+    }
+
+    #[test]
+    fn a_new_pin_records_the_failure_and_a_donors_copy_is_no_leaf() {
+        let w = wanted();
+        let own = w.new_pin(
+            locked("a"),
+            "2026-01-01".into(),
+            "sha256-C".into(),
+            Some(true),
+            None,
+        );
+        assert_eq!(own.reason, Reason::Build);
+        assert_eq!(own.failed_drv.as_deref(), Some("/nix/store/aaa-lib.drv"));
+        assert_eq!(own.trail, ["lib", "app"]);
+        assert!(own.leaf);
+        assert_eq!(own.overlays, Some(true));
+        let donated = w.new_pin(
+            locked("a"),
+            "2026-01-01".into(),
+            "sha256-C".into(),
+            None,
+            Some("stable".into()),
+        );
+        assert!(!donated.leaf);
+        assert_eq!(donated.donor.as_deref(), Some("stable"));
+    }
+
+    #[test]
+    fn a_retried_pin_keeps_its_date_and_a_failure_without_a_package_keeps_its_record() {
+        let w = wanted();
+        let old = w.new_pin(
+            locked("a"),
+            "2026-01-01".into(),
+            "sha256-C".into(),
+            None,
+            None,
+        );
+        let again = w.refresh_retried(old.clone(), "sha256-D".into(), "2026-02-02");
+        assert_eq!(again.since, "2026-01-01");
+        assert_eq!(again.checked_nar_hash, "sha256-D");
+        assert_eq!(again.tried.as_deref(), Some("2026-02-02"));
+        let bare = Wanted {
+            failed_drv: None,
+            root_drv: None,
+            ..wanted()
+        };
+        let kept = bare.refresh_retried(old.clone(), "sha256-D".into(), "2026-02-02");
+        assert_eq!(kept.failed_drv, old.failed_drv);
+        assert_eq!(kept.tried, None);
+        let good = w.reuse_good(old, "sha256-E".into());
+        assert_eq!(good.checked_nar_hash, "sha256-E");
+        assert_eq!(good.tried, None);
+    }
+
+    #[test]
+    fn pinned_sets_are_reported_with_one_revision_when_they_agree() {
+        let w = wanted();
+        let at = |rev| w.new_pin(locked(rev), "2026-01-01".into(), "x".into(), None, None);
+        let same = [
+            ("nixpkgs".to_string(), "app".to_string(), at("a")),
+            ("unstable".to_string(), "app".to_string(), at("a")),
+        ];
+        let text = describe_added(&same);
+        assert!(text.starts_with("(nixpkgs, unstable) at "), "{text}");
+        let differ = [
+            ("nixpkgs".to_string(), "app".to_string(), at("a")),
+            ("unstable".to_string(), "app".to_string(), at("b")),
+        ];
+        let text = describe_added(&differ);
+        assert!(
+            text.contains("nixpkgs at ") && text.contains(", unstable at "),
+            "{text}"
+        );
+        assert_eq!(
+            describe_skipped(&[("app".into(), "nixpkgs".into(), "it is old".into())]),
+            "app (nixpkgs) fails: it is old"
+        );
     }
 
     #[test]

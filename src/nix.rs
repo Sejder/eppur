@@ -4,13 +4,48 @@ use crate::logparse;
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
 use std::io::{BufRead, BufReader, IsTerminal, Read, Write};
+use std::os::fd::AsFd;
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::mpsc;
+use std::sync::{Mutex, mpsc};
 
-/// How many evaluations run at once: each holds a whole system in memory.
-const MAX_PARALLEL_EVALS: usize = 4;
+/// How many evaluations run at once by default: each holds a whole system in
+/// memory.
+pub const DEFAULT_EVAL_JOBS: usize = 4;
+
+static EVAL_JOBS: AtomicUsize = AtomicUsize::new(DEFAULT_EVAL_JOBS);
+static EXTRA_ARGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// Arguments for every nix command (such as --max-jobs, --builders or
+/// --option NAME VALUE), and how many evaluations may run at once.
+pub fn configure(extra_args: Vec<String>, eval_jobs: usize) {
+    if let Ok(mut args) = EXTRA_ARGS.lock() {
+        *args = extra_args;
+    }
+    EVAL_JOBS.store(eval_jobs.max(1), Ordering::Relaxed);
+}
+
+/// Refuse extra arguments nix does not take where eppur puts them, before
+/// the subcommand: left to the run, each target's evaluation would fail on
+/// them and the target be held as a configuration that does not evaluate.
+pub fn check_extra_args() -> Result<()> {
+    let extra = EXTRA_ARGS.lock().map(|a| a.clone()).unwrap_or_default();
+    if extra.is_empty() {
+        return Ok(());
+    }
+    let mut cmd = command();
+    cmd.args(["eval", "--expr", "1"]);
+    let out = run(cmd, "nix eval")?;
+    if !out.status.success() {
+        bail!(
+            "nix does not accept the extra arguments {:?} (programs.eppur.nixArgs and --nix-arg), which go before its subcommand:\n{}",
+            extra.join(" "),
+            tail(&out.stderr, 5)
+        );
+    }
+    Ok(())
+}
 
 pub struct Nix {
     flake: String,
@@ -25,6 +60,9 @@ fn command() -> Command {
     let mut c = Command::new("nix");
     c.args(["--extra-experimental-features", "nix-command flakes"]);
     c.args(["--option", "warn-dirty", "false"]);
+    if let Ok(args) = EXTRA_ARGS.lock() {
+        c.args(args.iter());
+    }
     c
 }
 
@@ -119,16 +157,24 @@ fn run_logged(
     Ok((status, out, errors))
 }
 
-/// `f` over `items` with at most MAX_PARALLEL_EVALS at once, results in the
-/// order of `items`.
+/// `f` over `items` with at most the configured number of evaluations at once,
+/// results in the order of `items`.
 pub fn parallel_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> R + Sync) -> Vec<R> {
+    parallel_map_n(EVAL_JOBS.load(Ordering::Relaxed), items, f)
+}
+
+fn parallel_map_n<T: Sync, R: Send>(
+    jobs: usize,
+    items: &[T],
+    f: impl Fn(&T) -> R + Sync,
+) -> Vec<R> {
     if items.len() < 2 {
         return items.iter().map(f).collect();
     }
     let next = AtomicUsize::new(0);
     let done = std::sync::Mutex::new(Vec::with_capacity(items.len()));
     std::thread::scope(|scope| {
-        for _ in 0..MAX_PARALLEL_EVALS.min(items.len()) {
+        for _ in 0..jobs.min(items.len()) {
             scope.spawn(|| {
                 loop {
                     let i = next.fetch_add(1, Ordering::Relaxed);
@@ -195,10 +241,14 @@ impl Monitor {
     pub fn start() -> Self {
         let nom = (std::io::stderr().is_terminal() && !log::is_quiet())
             .then(|| {
+                let shown = std::io::stderr()
+                    .as_fd()
+                    .try_clone_to_owned()
+                    .map_or_else(|_| Stdio::inherit(), Stdio::from);
                 Command::new("nom")
                     .arg("--json")
                     .stdin(Stdio::piped())
-                    .stdout(Stdio::inherit())
+                    .stdout(shown)
                     .stderr(Stdio::inherit())
                     .spawn()
                     .ok()
@@ -590,7 +640,10 @@ pub fn available(out: &str) -> bool {
         cmd.arg(out);
         run(cmd, "nix path-info").is_ok_and(|o| o.status.success())
     };
-    valid(None) || substituters().iter().any(|s| valid(Some(s)))
+    valid(None)
+        || parallel_map_n(substituters().len(), substituters(), |s| valid(Some(s)))
+            .into_iter()
+            .any(|found| found)
 }
 
 /// A flake.lock node's `locked` as a flake reference for the command line.
@@ -631,6 +684,21 @@ mod tests {
         assert_eq!(nix_string("plain"), r#""plain""#);
         assert_eq!(nix_string(r#"a"b\c"#), r#""a\"b\\c""#);
         assert_eq!(nix_string("${x} ''"), r#""\${x} ''""#);
+    }
+
+    #[test]
+    fn parallel_map_runs_at_most_the_asked_for_jobs() {
+        let running = AtomicUsize::new(0);
+        let peak = AtomicUsize::new(0);
+        let items: Vec<usize> = (0..12).collect();
+        parallel_map_n(3, &items, |_| {
+            let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            running.fetch_sub(1, Ordering::SeqCst);
+        });
+        assert!(peak.load(Ordering::SeqCst) <= 3);
+        assert!(peak.load(Ordering::SeqCst) >= 2);
     }
 
     #[test]
