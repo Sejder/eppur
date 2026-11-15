@@ -646,19 +646,14 @@ impl std::fmt::Display for Closing {
 }
 
 /// The counts of a run's changes, as the closing line reports them.
-fn tally(changes: &[Change]) -> String {
-    let parts: Vec<String> = ["pinned", "unpinned", "held", "released", "moved to a donor"]
+fn tally(changes: &[Change]) -> Vec<String> {
+    ["pinned", "unpinned", "held", "released", "moved to a donor"]
         .into_iter()
         .filter_map(|word| {
             let n = changes.iter().filter(|c| c.word() == word).count();
             (n > 0).then(|| format!("{n} {word}"))
         })
-        .collect();
-    if parts.is_empty() {
-        "nothing pinned or unpinned in this run".into()
-    } else {
-        parts.join(", ")
-    }
+        .collect()
 }
 
 /// Run the engine, and again each time it finds flake inputs to take back: a
@@ -1051,7 +1046,12 @@ fn reconcile_run(
 
     if args.dry_run {
         guard::restore_quietly()?;
-        log::change(&format!("dry run: {}", tally(&report.changes)));
+        let parts = tally(&report.changes);
+        log::change(&if parts.is_empty() {
+            "no changes".to_string()
+        } else {
+            parts.join(", ")
+        });
         if args.fail_on_hold && report.held > 0 {
             return Ok(3);
         }
@@ -1113,11 +1113,9 @@ fn reconcile_run(
     if let Closing::Committed(what) = &closing {
         summary.committed = Some(what.clone());
     }
-    let done = format!(
-        "done: {} built, {}; {closing}",
-        report.built.len(),
-        tally(&report.changes)
-    );
+    let mut parts = vec![format!("{} built", report.built.len())];
+    parts.extend(tally(&report.changes));
+    let done = format!("{}; {closing}", parts.join(", "));
     // Files left changed are worth a line under --quiet too.
     if matches!(closing, Closing::Uncommitted) {
         log::change(&done);

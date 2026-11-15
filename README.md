@@ -23,7 +23,7 @@ eppur: flake /home/alice/nixos (config /etc/eppur.json)
 eppur: round 1: evaluating and building host laptop
 eppur: pinned host laptop: sbctl (nixpkgs) at 718f670e8453 from 2026-10-20: sbctl-0.18 failed to build
 eppur: round 2: evaluating and building host laptop with 1 pinned package
-eppur: done: 1 built, 1 pinned; flake.lock and pins.json uncommitted
+eppur: 1 built, 1 pinned; flake.lock and pins.json uncommitted
 eppur: switching host laptop with nh
 ...
 $ eppur switch --update          # a few days later, sbctl is fixed upstream

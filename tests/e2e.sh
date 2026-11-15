@@ -943,7 +943,7 @@ expect_pins e ""
 revision broken false 33 ok
 eppur_ build --update || fail "breaking both sets gave up"
 expect_log "pinned host e: app (toypkgs, toypkgs2)"
-expect_log "done: 1 built, 1 pinned"
+expect_log "eppur: 1 built, 1 pinned"
 expect_pins e "toypkgs.app toypkgs2.app"
 "$eppur" status --config "$config" >"$work/stdout" 2>/dev/null
 grep -qE '^host e +app \(toypkgs, toypkgs2\) ' "$work/stdout" || fail "status does not show one row for app: $(cat "$work/stdout")"

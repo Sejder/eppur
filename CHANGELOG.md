@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- The closing line is shorter: `eppur: 4 built; flake.lock and pins.json
+  uncommitted` instead of `eppur: done: 4 built, nothing pinned or unpinned
+  in this run; ...`. A dry run that changes nothing ends with `eppur:
+  (dry run) no changes` instead of saying "dry run" twice.
 - On older Nix (2.19.4 and 2.24.14 at least), a build for another platform is reported as "a
   'SYSTEM' with features {} is required to build 'DRV', but I am a ...",
   which eppur did not read: the run stopped with "the build failed without
