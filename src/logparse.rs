@@ -153,8 +153,10 @@ struct NixLine<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NixLogEvent {
     /// An "error (ignored)": nix carried on without it, as when commands
-    /// running side by side find its evaluation cache busy. Not a failure, and
-    /// not worth showing.
+    /// running side by side find its evaluation cache busy. Also the
+    /// error-level "waiting for another Nix process to finish fetching input"
+    /// that commands running side by side print while one fetches what the
+    /// others need. Not a failure, and not worth showing.
     IgnoredError,
     /// The text of an error-level message.
     Error(String),
@@ -175,7 +177,10 @@ pub fn parse_nix_line(line: &str) -> NixLogEvent {
         Some("msg") if parsed.level == Some(0) => {
             if let Some(msg) = parsed.msg {
                 let clean = strip_ansi(&msg);
-                if clean.trim_start().starts_with("error (ignored)") {
+                let start = clean.trim_start();
+                if start.starts_with("error (ignored)")
+                    || start.starts_with("waiting for another Nix process")
+                {
                     NixLogEvent::IgnoredError
                 } else {
                     NixLogEvent::Error(clean)
@@ -394,6 +399,9 @@ mod tests {
         };
         assert!(is_ignored_error(&line(
             "error (ignored): SQLite database 'x.sqlite' is busy"
+        )));
+        assert!(is_ignored_error(&line(
+            "waiting for another Nix process to finish fetching input 'git+file:///x'..."
         )));
         assert!(!is_ignored_error(&line("error: attribute 'x' missing")));
         assert!(!is_ignored_error("plain text"));
