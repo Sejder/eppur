@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- New `eppur retry --all` queues a retry of every pin eppur made, on every
+  host and home in `pins.json`, or on the one `--host` or `--home` names.
+  `--input` narrows it to one input; pins made by hand are left.
 - The closing line is shorter: `eppur: 4 built; flake.lock and pins.json
   uncommitted` instead of `eppur: done: 4 built, nothing pinned or unpinned
   in this run; ...`. A dry run that changes nothing ends with `eppur:

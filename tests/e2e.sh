@@ -1017,6 +1017,11 @@ eppur_ build --no-commit || fail "the run after clear gave up"
 expect_pins b "toypkgs.app"
 [ "$(field b toypkgs app locked.rev)" = "$app_rev" ] || fail "app was pinned again at $(field b toypkgs app locked.rev), not $app_rev"
 [ -z "$(held_reason b)" ] || fail "b was held after clear: $(held_reason b)"
+"$eppur" retry --all --config "$config" 2>"$log" || fail "retry --all failed: $(cat "$log")"
+expect_log "host b: retry queued for app (toypkgs)"
+eppur_ build --no-commit || fail "the retry --all run gave up"
+expect_log "retrying host b: app (toypkgs)"
+expect_pins b "toypkgs.app"
 if "$eppur" retry hello --host b --config "$config" 2>"$log"; then fail "retry of an attr that is not pinned succeeded"; fi
 expect_log "hello is not pinned on host b"
 

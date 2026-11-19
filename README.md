@@ -233,8 +233,8 @@ the last lock any target of the flake built with, then the current
 input moves, the pin (with the package's pins in other sets from the same
 failure) is dropped for the next build; if the package builds, the pin is
 gone, otherwise it comes back with its original date. `eppur retry` asks
-for the same without waiting for the input to move. Manual pins
-(`eppur pin`) are never retried.
+for the same without waiting for the input to move, and `eppur retry --all`
+for every pin at once. Manual pins (`eppur pin`) are never retried.
 
 A build failure is only retried when there is something new to try: the pin
 records the package's own derivation, and when its input moves but the
@@ -309,12 +309,13 @@ The verbs follow `nh` and `nixos-rebuild`:
 | `eppur update` | `nix flake update`, keeping a pinned flake input where it is until upstream has a new revision |
 | `eppur pin <attr> [--input I] [--old-lock FILE]` | pin by hand (in `programs.eppur.input` by default), at the current lock or at the input's revision in `FILE`, e.g. a `flake.lock` from git history for a package that builds but misbehaves; kept until cleared |
 | `eppur retry <attr> [--input I]` | have the next run retry a pin eppur made: the pin goes if the package builds, and stays at its revision if it still fails; `status` shows it as "retry queued" |
+| `eppur retry --all [--input I]` | the same for every pin eppur made, on every host and home in `pins.json` (or the one `--host`/`--home` names); pins made by hand are left |
 | `eppur clear <attr> [--input I]` (or `unpin`) | remove a pin; if the package still fails, the next run pins it again at the revision it last built with |
 | `eppur clear --flake-input I` | remove a flake input's pin; `flake.lock` stays until the next update moves it, and it is pinned again if it still fails then |
 | `eppur clear --held` | release a held host or home: drop its held lock, so machines that skip held entries update again, and the next run builds it with the current lock |
 | `eppur merge <file>` | fold another `pins.json` in; per host or home, the entry from the newer lock wins, keeping pins made by hand here |
 
-`why`, `pin` and `clear` act on this machine's entry, or on `--host NAME` /
+`why`, `pin`, `retry` and `clear` act on this machine's entry, or on `--host NAME` /
 `--home NAME`, which must be configured (or, for `why` and `clear`, have an
 entry). `pin`, `clear` and `merge` only change `pins.json`; the next `build`,
 `switch` or `boot` applies it, and commits it with `--commit` or

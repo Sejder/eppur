@@ -1717,6 +1717,66 @@ pub fn retry(at: &Where, pick: &Pick, attr: &str, input: Option<&str>) -> Result
     Ok(ExitCode::SUCCESS)
 }
 
+pub fn retry_all(at: &Where, pick: &Pick, input: Option<&str>) -> Result<ExitCode> {
+    let ctx = Ctx::open(at, false)?;
+    ctx.announce();
+    check_flake(&ctx)?;
+    let _run_lock = guard::lock_flake(&ctx.flake)?;
+    let pins_path = ctx.pins_path();
+    let mut file = PinsFile::load(&pins_path)?;
+    let targets: Vec<Target> = if pick.host.is_some() || pick.home.is_some() {
+        vec![ctx.target(pick, Some(&file))?]
+    } else {
+        file.entries()
+            .map(|(kind, name, _)| Target::new(kind, name))
+            .collect()
+    };
+    let mut queued = Vec::new();
+    let mut manual = 0;
+    for target in &targets {
+        if file.entry(target.kind, &target.name).is_none() {
+            continue;
+        }
+        let entry = file.entry_mut(target.kind, &target.name);
+        let mut names = Vec::new();
+        for (i, set) in &mut entry.pins {
+            if input.is_some_and(|want| want != i) {
+                continue;
+            }
+            for (attr, pin) in set.iter_mut() {
+                if pin.reason == Reason::Manual {
+                    manual += 1;
+                    continue;
+                }
+                pin.checked_nar_hash.clear();
+                names.push(format!("{attr} ({i})"));
+            }
+        }
+        if !names.is_empty() {
+            queued.push(format!("{target}: retry queued for {}", names.join(", ")));
+        }
+    }
+    if queued.is_empty() {
+        log::info(&format!(
+            "nothing to retry: no pins eppur made{}",
+            input.map(|i| format!(" in {i}")).unwrap_or_default()
+        ));
+    } else {
+        file.save(&pins_path)?;
+        for line in &queued {
+            log::change(line);
+        }
+    }
+    match manual {
+        0 => {}
+        1 => log::info("1 pin made by hand is left; remove it with 'eppur clear'"),
+        n => log::info(&format!(
+            "{n} pins made by hand are left; remove them with 'eppur clear'"
+        )),
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 pub fn clear_input(at: &Where, input: &str) -> Result<ExitCode> {
     let ctx = Ctx::open(at, false)?;
     ctx.announce();

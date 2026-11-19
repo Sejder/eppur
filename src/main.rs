@@ -106,13 +106,18 @@ enum Command {
     /// Have the next run retry a pin eppur made, without waiting for its
     /// package set to move: the pin goes if the package builds, and stays at
     /// its revision if it still fails.
+    #[command(group = clap::ArgGroup::new("what").required(true).args(["attr", "all"]))]
     Retry {
         #[command(flatten)]
         pick: cmd::Pick,
         /// The pinned attribute, e.g. firefox.
         #[arg(value_name = "ATTR")]
-        attr: String,
-        /// Only retry the pin in this input; by default every input pinning ATTR.
+        attr: Option<String>,
+        /// Retry every pin eppur made, on every host and home in pins.json
+        /// unless --host or --home names one; pins made by hand are left.
+        #[arg(long, conflicts_with = "attr")]
+        all: bool,
+        /// Only retry pins in this input; by default every input.
         #[arg(long, value_name = "INPUT")]
         input: Option<String>,
     },
@@ -175,7 +180,15 @@ fn main() -> ExitCode {
             input,
             old_lock,
         } => cmd::pin(at, pick, attr, input.as_deref(), old_lock.as_deref()),
-        Command::Retry { pick, attr, input } => cmd::retry(at, pick, attr, input.as_deref()),
+        Command::Retry {
+            pick,
+            attr,
+            all: _,
+            input,
+        } => match attr {
+            Some(attr) => cmd::retry(at, pick, attr, input.as_deref()),
+            None => cmd::retry_all(at, pick, input.as_deref()),
+        },
         Command::Clear {
             pick,
             attr,
