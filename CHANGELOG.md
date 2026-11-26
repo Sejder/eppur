@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.2
 
 - A pin for a failed build is retried at once when the output of the
   derivation that failed turns up: it is in the store or a substituter has
