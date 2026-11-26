@@ -244,6 +244,14 @@ only), it is not built again. It is retried once the derivation changes, or
 once `retrySameDerivationAfterDays` (7) have passed since it was last tried,
 for a failure that may have been a flaky test; `0` retries on every move.
 
+A failure is also retried at once, before its input moves and before
+`retrySameDerivationAfterDays`, when the output of the derivation that
+failed turns up: it is in the store or one of the substituters has it. That
+happens when another machine's `pins.json` is merged in, or when a binary
+cache finishes a package a build host had to build itself and failed. It is
+retried this way once per failure: if the same derivation fails again, the
+pin waits as usual.
+
 **Donor.** An input listed in `programs.eppur.donors`, such as a stable
 nixpkgs next to an unstable one, that a failed package may be taken from
 instead of the revision it last built with. When a package fails and a donor
@@ -619,7 +627,7 @@ host server  -                                       whole host held  2026-10-01
   "hosts": {
     "laptop": { "lockSha256": "...", "lockLastModified": 1793083946,
                 "pins": { "nixpkgs": { "sbctl": { "locked": { ... }, "since": "2026-10-27", "reason": "build",
-                                                  "failedDrv": "...", "trail": [ ... ], "checkedNarHash": "..." } } } },
+                                                  "failedDrv": "...", "failedOut": "...", "trail": [ ... ], "checkedNarHash": "..." } } } },
     "server": { "held": { "since": "2026-10-27", "reason": "...", "lock": { ... } } } },
   "homes": { },
   "inputs": { "atlas": { "locked": { ... }, "failedNarHash": "...", "since": "2026-11-02", "reason": "build",

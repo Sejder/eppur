@@ -342,6 +342,7 @@ mod tests {
             since: since.into(),
             reason: Reason::Eval,
             failed_drv: None,
+            failed_out: None,
             trail: Vec::new(),
             error: None,
             overlays: None,

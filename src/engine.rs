@@ -163,6 +163,7 @@ struct Wanted {
     members: Vec<(String, String)>,
     reason: Reason,
     failed_drv: Option<String>,
+    failed_out: Option<String>,
     /// For a build failure, the drv of the package the members name.
     root_drv: Option<String>,
     /// Nothing else in the system depends on the package.
@@ -194,6 +195,7 @@ impl Wanted {
     ) -> Pin {
         let mut pin = Pin::new(locked, since, self.reason, checked);
         pin.failed_drv = self.failed_drv.clone();
+        pin.failed_out = self.failed_out.clone();
         pin.trail = self.trail.clone();
         pin.error = self.error.clone();
         pin.overlays = overlays;
@@ -210,6 +212,9 @@ impl Wanted {
     fn refresh_retried(&self, mut pin: Pin, checked: String, today: &str) -> Pin {
         pin.checked_nar_hash = checked;
         if self.failed_drv.is_some() || self.error.is_some() {
+            if pin.failed_drv != self.failed_drv {
+                pin.failed_out = self.failed_out.clone();
+            }
             pin.failed_drv = self.failed_drv.clone();
             pin.trail = self.trail.clone();
             pin.error = self.error.clone();
@@ -228,6 +233,7 @@ impl Wanted {
     fn reuse_good(&self, mut pin: Pin, checked: String) -> Pin {
         pin.checked_nar_hash = checked;
         pin.failed_drv = self.failed_drv.clone();
+        pin.failed_out = self.failed_out.clone();
         pin.trail = self.trail.clone();
         pin.error = self.error.clone();
         pin.root_drv = self.root_drv.clone();
@@ -364,12 +370,40 @@ impl Engine {
         // What each target needs evaluated before its first round, side by
         // side: each of these evaluates a whole configuration.
         let nix = &self.nix;
-        let probes =
-            crate::nix::parallel_map(&self.targets, |t| nix.eval_apply(&t.eppur_config(), PROBE));
+        let outs: Vec<String> = self
+            .targets
+            .iter()
+            .filter_map(|t| original.entry(t.kind, &t.name))
+            .flat_map(|e| e.iter())
+            .filter(|(_, _, p)| p.reason == Reason::Build && !p.checked_nar_hash.is_empty())
+            .filter_map(|(_, _, p)| p.failed_out.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let (probes, built_since) = std::thread::scope(|s| {
+            let built = s.spawn(|| {
+                outs.iter()
+                    .zip(crate::nix::parallel_map(&outs, |o| {
+                        crate::nix::available(o)
+                    }))
+                    .filter(|(_, found)| *found)
+                    .map(|(o, _)| o.clone())
+                    .collect::<HashSet<String>>()
+            });
+            let probes = crate::nix::parallel_map(&self.targets, |t| {
+                nix.eval_apply(&t.eppur_config(), PROBE)
+            });
+            (probes, built.join().unwrap_or_default())
+        });
         let requests: Vec<(&Target, Vec<CopyRequest>)> = self
             .targets
             .iter()
-            .map(|t| (t, self.copy_requests(original.entry(t.kind, &t.name))))
+            .map(|t| {
+                (
+                    t,
+                    self.copy_requests(original.entry(t.kind, &t.name), &built_since),
+                )
+            })
             .collect();
         for found in crate::nix::parallel_map(&requests, |(t, r)| fetch_copies(nix, t, r)) {
             self.copies
@@ -380,7 +414,7 @@ impl Engine {
             .targets
             .iter()
             .zip(probes)
-            .map(|(t, probe)| self.init(&original, t, probe))
+            .map(|(t, probe)| self.init(&original, t, probe, &built_since))
             .collect::<Result<_>>()?;
 
         for round in 1..=self.max_rounds {
@@ -776,7 +810,11 @@ impl Engine {
     /// What the startup checks of `entry`'s pins will ask `copy` for, so they
     /// can all be evaluated at once: whether a moved pin's package changed, the
     /// donors of a leaf pin, and a version not recorded yet.
-    fn copy_requests(&self, entry: Option<&Entry>) -> Vec<CopyRequest> {
+    fn copy_requests(
+        &self,
+        entry: Option<&Entry>,
+        built_since: &HashSet<String>,
+    ) -> Vec<CopyRequest> {
         let mut requests: Vec<CopyRequest> = Vec::new();
         let Some(entry) = entry else {
             return requests;
@@ -797,6 +835,10 @@ impl Engine {
                 && pin.root_drv.is_some()
                 && self.retry_same_after_days > 0
                 && !pin.checked_nar_hash.is_empty()
+                && !pin
+                    .failed_out
+                    .as_ref()
+                    .is_some_and(|o| built_since.contains(o))
                 && self.new_lock.nar_hash(input).as_deref() != Some(pin.checked_nar_hash.as_str())
                 && let Some(new) = self.new_lock.locked(input)
             {
@@ -817,9 +859,41 @@ impl Engine {
         requests
     }
 
-    fn init(&self, original: &PinsFile, target: &Target, probe: Result<Value>) -> Result<State> {
+    fn init(
+        &self,
+        original: &PinsFile,
+        target: &Target,
+        probe: Result<Value>,
+        built_since: &HashSet<String>,
+    ) -> Result<State> {
         let base = original.entry(target.kind, &target.name).cloned();
         let mut entry = base.clone().unwrap_or_default();
+        let mut built_attrs: BTreeMap<String, (Vec<String>, String)> = BTreeMap::new();
+        for (input, set) in &mut entry.pins {
+            for (attr, pin) in set.iter_mut() {
+                if pin.reason == Reason::Build
+                    && !pin.checked_nar_hash.is_empty()
+                    && let Some(out) = pin.failed_out.take_if(|o| built_since.contains(o))
+                {
+                    pin.checked_nar_hash.clear();
+                    let seen = built_attrs.entry(attr.clone()).or_insert_with(|| {
+                        (
+                            Vec::new(),
+                            pin.failed_drv
+                                .as_deref()
+                                .map_or(out, |d| crate::summary::drv_name(d).to_string()),
+                        )
+                    });
+                    seen.0.push(input.clone());
+                }
+            }
+        }
+        for (attr, (inputs, name)) in &built_attrs {
+            log::info(&format!(
+                "{target}: {attr} ({}): {name} has been built since, here or in a binary cache",
+                inputs.join(", ")
+            ));
+        }
         let held_before = entry.held.take();
         for (input, attr, pin) in entry.iter().filter(|(_, _, p)| p.insecure) {
             match &pin.donor {
@@ -1385,6 +1459,7 @@ impl Engine {
                         members: inputs.into_iter().map(|i| (i, outer.clone())).collect(),
                         reason: Reason::Eval,
                         failed_drv: None,
+                        failed_out: None,
                         root_drv: None,
                         leaf: false,
                         cause: if insecure {
@@ -1413,6 +1488,7 @@ impl Engine {
                             members: members.into_iter().map(|i| (i, outer.clone())).collect(),
                             reason: Reason::Eval,
                             failed_drv: None,
+                            failed_out: None,
                             root_drv: None,
                             leaf: false,
                             cause: format!("nixpkgs now marks {attr} as insecure"),
@@ -1499,6 +1575,7 @@ impl Engine {
                     )));
                 }
             };
+            let failed_out = crate::nix::out_path(drv).ok();
             for root in &roots {
                 // Everything above the root rebuilds once it is swapped, the
                 // packages that are not top-level attributes (python3Packages.*)
@@ -1536,6 +1613,7 @@ impl Engine {
                         members,
                         reason: Reason::Build,
                         failed_drv: Some(drv.to_string()),
+                        failed_out: failed_out.clone(),
                         root_drv: Some(root.to_string()),
                         leaf: dependents == 0,
                         cause: format!("{} failed to build", graph.display_name(drv)),
@@ -3040,6 +3118,7 @@ mod tests {
             members: vec![("nixpkgs".into(), "app".into())],
             reason: Reason::Build,
             failed_drv: Some("/nix/store/aaa-lib.drv".into()),
+            failed_out: None,
             root_drv: Some("/nix/store/bbb-app.drv".into()),
             leaf: true,
             cause: "lib failed".into(),
@@ -3097,6 +3176,7 @@ mod tests {
         assert_eq!(again.tried.as_deref(), Some("2026-02-02"));
         let bare = Wanted {
             failed_drv: None,
+            failed_out: None,
             root_drv: None,
             ..wanted()
         };
@@ -3106,6 +3186,29 @@ mod tests {
         let good = w.reuse_good(old, "sha256-E".into());
         assert_eq!(good.checked_nar_hash, "sha256-E");
         assert_eq!(good.tried, None);
+    }
+
+    #[test]
+    fn a_failure_whose_output_turned_up_is_retried_for_it_once() {
+        let w = Wanted {
+            failed_out: Some("/nix/store/ccc-lib".into()),
+            ..wanted()
+        };
+        let pin = w.new_pin(locked("a"), "2026-01-01".into(), "x".into(), None, None);
+        assert_eq!(pin.failed_out.as_deref(), Some("/nix/store/ccc-lib"));
+        let retried = Pin {
+            failed_out: None,
+            ..pin
+        };
+        let same = w.refresh_retried(retried.clone(), "y".into(), "2026-02-02");
+        assert_eq!(same.failed_out, None);
+        let other = Wanted {
+            failed_drv: Some("/nix/store/ddd-other.drv".into()),
+            failed_out: Some("/nix/store/eee-other".into()),
+            ..wanted()
+        };
+        let moved = other.refresh_retried(retried, "y".into(), "2026-02-02");
+        assert_eq!(moved.failed_out.as_deref(), Some("/nix/store/eee-other"));
     }
 
     #[test]

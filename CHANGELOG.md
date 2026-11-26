@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- A pin for a failed build is retried at once when the output of the
+  derivation that failed turns up: it is in the store or a substituter has
+  it. Before, it waited for its input to move to a new derivation, or for
+  `retrySameDerivationAfterDays`. A build host that ran before
+  cache.nixos.org had a package, and failed to build it itself, pinned it for
+  every host using it, and `eppur merge` carried that pin to a machine that
+  had already fetched the same derivation. New pins record the output as
+  `failedOut`; it is retried this way once per failure, and pins made before
+  this version are not.
+
 ## 0.2.1
 
 - New `--retry` on `build`, `switch` and `boot` retries every pin eppur made

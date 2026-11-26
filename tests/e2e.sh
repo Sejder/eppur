@@ -1031,6 +1031,18 @@ cmp -s "$sys/pins.json" "$work/pins.before" || fail "build --retry --dry-run cha
 eppur_ build --retry --no-commit || fail "the build --retry run gave up"
 expect_log "retrying host b: app (toypkgs)"
 expect_pins b "toypkgs.app"
+failed_out=$(field b toypkgs app failedOut)
+[ -n "$failed_out" ] || fail "app's pin records no failedOut"
+built_out=$(nix build --no-link --print-out-paths --impure --expr "derivation { name = \"e2e-built-$RANDOM\"; system = \"$system\"; builder = \"/bin/sh\"; args = [ \"-c\" \"echo > \$out\" ]; }") || fail "could not build a stand-in output"
+sed -i "/\"failedOut\"/s|$failed_out|$built_out|" "$sys/pins.json"
+[ "$(field b toypkgs app failedOut)" = "$built_out" ] || fail "could not point app's failedOut at $built_out"
+eppur_ build --no-commit || fail "the run after the failed output turned up gave up"
+grep -q "host b: app (toypkgs): .* has been built since" "$log" || fail "log lacks the built-since line for app"
+expect_log "retrying host b: app (toypkgs)"
+expect_pins b "toypkgs.app"
+[ -z "$(field b toypkgs app failedOut)" ] || fail "app kept failedOut $(field b toypkgs app failedOut) after failing again on the same drv"
+eppur_ build --no-commit || fail "the run after app failed again gave up"
+reject_log "retrying host b"
 if "$eppur" retry hello --host b --config "$config" 2>"$log"; then fail "retry of an attr that is not pinned succeeded"; fi
 expect_log "hello is not pinned on host b"
 

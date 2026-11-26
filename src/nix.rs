@@ -594,7 +594,8 @@ pub fn is_valid(path: &str) -> Result<bool> {
     Ok(run(cmd, "nix path-info")?.status.success())
 }
 
-/// The `out` path of a built derivation, read from the drv itself.
+/// The `out` path of a derivation, or its first output's when it has no
+/// `out`, read from the drv itself.
 pub fn out_path(drv: &str) -> Result<String> {
     let mut cmd = command();
     cmd.args(["derivation", "show", drv]);
@@ -606,7 +607,14 @@ pub fn out_path(drv: &str) -> Result<String> {
     let path = drvs
         .as_object()
         .and_then(|o| o.values().next())
-        .and_then(|d| d["outputs"]["out"]["path"].as_str())
+        .and_then(|d| {
+            let outputs = d["outputs"].as_object()?;
+            outputs
+                .get("out")
+                .or_else(|| outputs.values().next())?
+                .get("path")?
+                .as_str()
+        })
         .with_context(|| format!("{drv} has no out path"))?;
     Ok(if path.starts_with('/') {
         path.to_string()

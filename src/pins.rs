@@ -48,6 +48,10 @@ pub struct Pin {
     pub reason: Reason,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failed_drv: Option<String>,
+    /// For a build failure, the output of `failed_drv`: once it is in the
+    /// store or a substituter has it, the pin is retried, once per failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_out: Option<String>,
     /// Derivation names from the failed drv up to the pinned package.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub trail: Vec<String>,
@@ -93,6 +97,7 @@ impl Pin {
             since,
             reason,
             failed_drv: None,
+            failed_out: None,
             trail: Vec::new(),
             error: None,
             overlays: None,
@@ -469,6 +474,7 @@ mod tests {
             since: since.into(),
             reason: Reason::Build,
             failed_drv: Some("/nix/store/aaa-libfoo-1.2.drv".into()),
+            failed_out: None,
             trail: vec!["libfoo-1.2".into(), "obs-studio-31".into()],
             error: None,
             overlays: None,
