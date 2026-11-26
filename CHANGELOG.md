@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.1
 
 - New `--retry` on `build`, `switch` and `boot` retries every pin eppur made
   for the hosts and homes the run builds, without a separate `eppur retry
