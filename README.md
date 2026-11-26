@@ -234,7 +234,8 @@ input moves, the pin (with the package's pins in other sets from the same
 failure) is dropped for the next build; if the package builds, the pin is
 gone, otherwise it comes back with its original date. `eppur retry` asks
 for the same without waiting for the input to move, and `eppur retry --all`
-for every pin at once. Manual pins (`eppur pin`) are never retried.
+(or `--retry` on `build`, `switch` and `boot`) for every pin at once.
+Manual pins (`eppur pin`) are never retried.
 
 A build failure is only retried when there is something new to try: the pin
 records the package's own derivation, and when its input moves but the
@@ -341,6 +342,7 @@ Options of `build`, `switch` and `boot`:
 | `--dry-run` | evaluate and build as usual and show what would be pinned and unpinned (marked `(dry run)`), then leave every file as it was |
 | `--commit` | commit `flake.lock` and `pins.json` after the run (the default with `programs.eppur.commit = true`) |
 | `--no-commit` | leave them uncommitted, whatever `programs.eppur.commit` says (the default otherwise) |
+| `--retry` | retry every pin eppur made for the hosts and homes the run builds, as `eppur retry --all` would; pins made by hand are left |
 | `--only NAME` | build only some of the configured hosts and homes; repeatable or comma-separated, and `host:NAME` or `home:NAME` where a host and a home share a name |
 | `--hold-local` | hold this machine's own host like any other instead of giving up; for a machine that builds a fleet |
 | `--gc-roots DIR` | keep every system that built alive under `DIR/eppur-host-<host>` and `DIR/eppur-home-<name>`, e.g. for a binary cache; without `--only`, the roots this flake's runs made for targets no longer configured are removed (they are listed in a hidden file there), and nothing else in `DIR` is touched. Give each flake its own `DIR`: a second flake rooting a target of the same name there is refused |

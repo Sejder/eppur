@@ -84,6 +84,11 @@ pub struct BuildArgs {
     /// Don't commit, overriding programs.eppur.commit.
     #[arg(long, overrides_with = "commit")]
     pub no_commit: bool,
+    /// Retry every pin eppur made for the hosts and homes this run builds,
+    /// as 'eppur retry --all' would, without waiting for their package sets
+    /// to move.
+    #[arg(long)]
+    pub retry: bool,
 
     /// Only these hosts or homes from the config; repeatable, or
     /// comma-separated. host:NAME or home:NAME where a host and a home share
@@ -932,6 +937,23 @@ fn reconcile_run(
     });
 
     // Any error from here on is restored by main, after it is printed.
+    if args.retry {
+        let mut file = PinsFile::load(&pins_path)?;
+        let (queued, manual) = queue_retries(&mut file, &targets, None);
+        if queued.is_empty() {
+            log::detail("nothing to retry: no pins eppur made for the hosts and homes of this run");
+        } else {
+            file.save(&pins_path)?;
+            for line in &queued {
+                log::detail(line);
+            }
+        }
+        match manual {
+            0 => {}
+            1 => log::detail("1 pin made by hand is left"),
+            n => log::detail(&format!("{n} pins made by hand are left")),
+        }
+    }
     let mut last_good = std::collections::HashMap::new();
     let last_good_pins: std::collections::HashMap<_, _> = targets
         .iter()
@@ -1731,9 +1753,30 @@ pub fn retry_all(at: &Where, pick: &Pick, input: Option<&str>) -> Result<ExitCod
             .map(|(kind, name, _)| Target::new(kind, name))
             .collect()
     };
+    let (queued, manual) = queue_retries(&mut file, &targets, input);
+    if queued.is_empty() {
+        log::info(&format!(
+            "nothing to retry: no pins eppur made{}",
+            input.map(|i| format!(" in {i}")).unwrap_or_default()
+        ));
+    } else {
+        file.save(&pins_path)?;
+        for line in &queued {
+            log::change(line);
+        }
+    }
+    report_manual_left(manual);
+    Ok(ExitCode::SUCCESS)
+}
+
+fn queue_retries(
+    file: &mut PinsFile,
+    targets: &[Target],
+    input: Option<&str>,
+) -> (Vec<String>, usize) {
     let mut queued = Vec::new();
     let mut manual = 0;
-    for target in &targets {
+    for target in targets {
         if file.entry(target.kind, &target.name).is_none() {
             continue;
         }
@@ -1756,17 +1799,10 @@ pub fn retry_all(at: &Where, pick: &Pick, input: Option<&str>) -> Result<ExitCod
             queued.push(format!("{target}: retry queued for {}", names.join(", ")));
         }
     }
-    if queued.is_empty() {
-        log::info(&format!(
-            "nothing to retry: no pins eppur made{}",
-            input.map(|i| format!(" in {i}")).unwrap_or_default()
-        ));
-    } else {
-        file.save(&pins_path)?;
-        for line in &queued {
-            log::change(line);
-        }
-    }
+    (queued, manual)
+}
+
+fn report_manual_left(manual: usize) {
     match manual {
         0 => {}
         1 => log::info("1 pin made by hand is left; remove it with 'eppur clear'"),
@@ -1774,7 +1810,6 @@ pub fn retry_all(at: &Where, pick: &Pick, input: Option<&str>) -> Result<ExitCod
             "{n} pins made by hand are left; remove them with 'eppur clear'"
         )),
     }
-    Ok(ExitCode::SUCCESS)
 }
 
 pub fn clear_input(at: &Where, input: &str) -> Result<ExitCode> {

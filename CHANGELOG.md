@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- New `--retry` on `build`, `switch` and `boot` retries every pin eppur made
+  for the hosts and homes the run builds, without a separate `eppur retry
+  --all`. Unlike that, nothing stays queued when the run is a dry run or its
+  files are restored.
 - New `eppur retry --all` queues a retry of every pin eppur made, on every
   host and home in `pins.json`, or on the one `--host` or `--home` names.
   `--input` narrows it to one input; pins made by hand are left.

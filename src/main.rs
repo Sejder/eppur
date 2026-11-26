@@ -105,7 +105,8 @@ enum Command {
     },
     /// Have the next run retry a pin eppur made, without waiting for its
     /// package set to move: the pin goes if the package builds, and stays at
-    /// its revision if it still fails.
+    /// its revision if it still fails. 'eppur switch --retry' (or build, boot)
+    /// retries every pin of the run instead.
     #[command(group = clap::ArgGroup::new("what").required(true).args(["attr", "all"]))]
     Retry {
         #[command(flatten)]
