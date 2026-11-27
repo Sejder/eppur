@@ -116,7 +116,7 @@ impl Git {
     pub fn changed(&self, paths: &[&Path]) -> Result<bool> {
         let out = self
             .command()
-            .args(["status", "--porcelain", "--"])
+            .args(["status", "--porcelain", "--untracked-files=no", "--"])
             .args(paths)
             .output()
             .context("spawning git status")?;

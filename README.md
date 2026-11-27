@@ -139,6 +139,9 @@ set it for keys such as `"alice@laptop"`. `eppur switch --update` then runs
   when `programs.nh` does not.
 - git, for committing; without it eppur still runs and says it cannot
   commit.
+- [tack](https://github.com/manic-systems/tack) 2.x for a flake pinned with
+  tack, when eppur updates it (tested with 2.0.0); see
+  [Pinned with tack](#pinned-with-tack).
 
 ## Concepts
 
@@ -313,14 +316,14 @@ The verbs follow `nh` and `nixos-rebuild`:
 | `eppur build [--update [INPUT...]]` | pin and unpin until every configured host builds; commit with `--commit` |
 | `eppur switch [--update [INPUT...]]` | the same, then switch this machine's host or home |
 | `eppur boot [--update [INPUT...]]` | the same, then make this machine boot into it |
-| `eppur status [--json]` | pinned packages and held hosts with their age |
+| `eppur status [--json \| --look]` | pinned packages and held hosts with their age; `--look` adds what `tack look` sees upstream |
 | `eppur why <attr>` | the failed derivation (or the evaluation error), the path up to the pinned package, the end of the build log |
-| `eppur update` | `nix flake update`, keeping a pinned flake input where it is until upstream has a new revision |
+| `eppur update` | `nix flake update` (or `tack update`), keeping a pinned flake input where it is until upstream has a new revision |
 | `eppur pin <attr> [--input I] [--old-lock FILE]` | pin by hand (in `programs.eppur.input` by default), at the current lock or at the input's revision in `FILE`, e.g. a `flake.lock` from git history for a package that builds but misbehaves; kept until cleared |
 | `eppur retry <attr> [--input I]` | have the next run retry a pin eppur made: the pin goes if the package builds, and stays at its revision if it still fails; `status` shows it as "retry queued" |
 | `eppur retry --all [--input I]` | the same for every pin eppur made, on every host and home in `pins.json` (or the one `--host`/`--home` names); pins made by hand are left |
 | `eppur clear <attr> [--input I]` (or `unpin`) | remove a pin; if the package still fails, the next run pins it again at the revision it last built with |
-| `eppur clear --flake-input I` | remove a flake input's pin; `flake.lock` stays until the next update moves it, and it is pinned again if it still fails then |
+| `eppur clear --flake-input I` | remove a flake input's pin (and unfreeze a tack pin eppur froze); the lock stays until the next update moves it, and it is pinned again if it still fails then |
 | `eppur clear --held` | release a held host or home: drop its held lock, so machines that skip held entries update again, and the next run builds it with the current lock |
 | `eppur merge <file>` | fold another `pins.json` in; per host or home, the entry from the newer lock wins, keeping pins made by hand here |
 
@@ -419,6 +422,8 @@ required, the rest default as the module options do):
 | `input` | `"nixpkgs"` | the flake input `pkgs` comes from |
 | `flake` | `programs.nh.flake` | the checkout eppur updates (not a store path) |
 | `hosts`, `homes` | `[ ]` | `nixosConfigurations` / `homeConfigurations` eppur builds when it runs here |
+| `locker` | `"auto"` | what locks the inputs: `"flake"` (`flake.lock`) or `"tack"`; `"auto"` picks tack when the flake has `.tack/pins.toml`. `--locker` overrides it |
+| `tack.package` | `null` | the tack eppur runs on a tack flake, installed with eppur; `null` leaves it to `PATH` |
 | `switcher` | `"nh"` | `"nh"` (4.x, given the built system's store path), or `"native"`: `nixos-rebuild` (with `--sudo`, i.e. nixos-rebuild-ng) for hosts, `home-manager` for homes |
 | `warnAfterDays` | `14` | report a pin or hold as stale, and log it as a warning, after this many days |
 | `deny` | `[ ]` | attributes never to pin, on top of the built-in list; `cuda*` matches a prefix |
@@ -491,6 +496,66 @@ warning, so set them in the NixOS configuration. Standalone, it uses its own
 `home-manager switch` with the native switcher). `autoUpgrade` there is a user
 timer that runs `eppur switch --update`; it runs while you are logged in, or
 always with `loginctl enable-linger`.
+
+## Pinned with tack
+
+[tack](https://github.com/manic-systems/tack) pins a flake's inputs in
+`.tack/pins.toml` and locks them in `.tack/pins.lock.json`, instead of
+`inputs` and `flake.lock`. eppur works on such a flake as on any other: it
+reads `pins.lock.json` as the lock, so `programs.eppur.input` names a tack pin
+(`nixpkgs`), and packages are pinned to that pin's last good revision. What
+changes is how eppur updates and holds things back, which it does with tack's
+own features:
+
+- **Updating** is `tack update`. `--update NAME...` takes tack's pins and
+  groups (`eppur switch --update desktop`). `tack update` checks the commits
+  it locks against the `signers` a pin names, so an unsigned commit stops the
+  run before anything builds. A build without `--update` runs `tack verify
+  --base HEAD` when a pin names signers and the lock differs from the
+  committed one, since then it came from somewhere other than `tack update`.
+- **Holding back a pin that breaks the build is `tack freeze`.** eppur puts
+  the pin back at its last good revision, as it would in `flake.lock`, and
+  freezes it there, so `pins.toml` shows the hold (`frozen = "<commit>"`, or
+  `frozen = true` for a tarball pin) and a `tack update` by hand leaves the
+  pin alone too. eppur unfreezes it to try upstream's next revision, and lets
+  it go once it builds. `pins.json` records each freeze eppur made
+  (`tackFrozen`); eppur never unfreezes a pin you froze yourself, nor one you
+  froze again since at another value. A pin whose next revision is still to
+  be tried stays unfrozen until a build has judged it.
+- **A pin you froze yourself** stays where you froze it; eppur does not
+  update it and does not roll it back. Name it in `--update` to move it, as
+  with `tack update`.
+- **Patched pins.** eppur builds the patched trees a lock names that this
+  machine's store does not have (`tack materialize`) before it evaluates, so
+  a fleet machine can build a lock made elsewhere. A pin with patches is
+  never rolled back (its patches may not apply to an older revision), and a
+  package pinned from a patched nixpkgs comes from the unpatched tree:
+  `pins.json` stores what `fetchTree` fetches, not a store path that exists
+  on one machine only.
+- **Commits** take `.tack/pins.lock.json`, `.tack/pins.toml`,
+  `.tack/patches` and `pins.json`, and nothing else in `.tack`. A run that
+  does not finish puts all of `.tack` back as it was.
+- **`eppur status --look`** adds `tack look`: how far each pin is behind
+  upstream.
+
+tack keeps a history of its own (`tack undo`). An eppur run that updates
+leaves a few entries there: unfreezing what it holds, the update, its own
+changes to the lock (an "(edited)" entry) and the freeze; `tack undo` steps
+back through them one at a time.
+
+The flake must not lock inputs of its own in `flake.lock` besides the tack
+pins: each input has to be locked in one place, or a rollback in one would be
+undone by the other. Move them with `tack init --convert`, or set `locker =
+"flake"` to ignore tack. tack has no `--override-input`, so while eppur tests
+whether an older revision of a pin fixes a failure, it writes that revision
+into `pins.lock.json` for the evaluation and puts the lock back afterwards
+(and on an interrupt).
+
+eppur runs the tack binary to update, to freeze and unfreeze, and to build
+patched trees. A build of a lock someone else updated needs none of that
+unless it holds a pin back or lets one go; without tack it then warns that
+`pins.toml` does not show the hold, which `pins.json` and the lock still
+keep.
 
 ## A fleet
 
@@ -644,7 +709,8 @@ not, then the entry from the newer lock (a held entry counts the lock it was
 tried against, `checkedLastModified`), and pins made by hand here are kept.
 `inputs` is one decision about one lock, so the map with the later
 `inputsChanged` is taken whole. `inputs` and `inputsChanged` are absent until an
-input is first pinned.
+input is first pinned. Under tack, an input pin also has `tackFrozen`, the
+`frozen` value eppur wrote for it in `pins.toml`.
 
 `pins.json` is code, like `flake.lock`: every `locked` node in it is fetched
 and imported when your systems evaluate. Only merge files from a build host
@@ -656,7 +722,10 @@ you trust, and review changes to it like any other change to the flake.
 cargo test             # unit tests
 nix flake check        # package, overlay, module and activation checks
 tests/e2e.sh           # a toy nixpkgs that breaks and heals, end to end
+tests/e2e-tack.sh      # the same on a flake pinned with tack
 ```
+
+`tests/e2e-tack.sh` also needs tack (`$TACK`, or `tack` on `PATH`).
 
 `tests/e2e.sh` needs Nix with flakes and uses `target/debug/eppur` (or
 `$EPPUR`). nh, nixos-rebuild and home-manager are replaced by stubs.

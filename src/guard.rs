@@ -8,8 +8,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, Once};
 use std::time::{Duration, Instant};
 
-/// The files a run must put back if it does not finish: flake.lock and
-/// pins.json as they were, or pins.json removed when the run created it.
+/// The files a run must put back if it does not finish: the lock and
+/// pins.json as they were, or pins.json removed when the run created it, and
+/// under tack the whole .tack directory, which tack's commands change.
 pub struct Restore {
     pub lock_path: PathBuf,
     pub lock: Vec<u8>,
@@ -19,12 +20,85 @@ pub struct Restore {
     /// The run added pins.json to the git index, which it was not in.
     pub untrack: bool,
     pub flake: PathBuf,
+    /// The files of a directory as they were, under tack its .tack.
+    pub tree: Option<Tree>,
+}
+
+/// The regular files under a directory, and their contents. Links are left
+/// out: tack's `patched` is a garbage collector root, not a file it edits.
+pub struct Tree {
+    pub dir: PathBuf,
+    pub files: Vec<(PathBuf, Vec<u8>)>,
+}
+
+fn walk(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        if kind.is_dir() {
+            walk(&entry.path(), out)?;
+        } else if kind.is_file() {
+            out.push(entry.path());
+        }
+    }
+    Ok(())
+}
+
+impl Tree {
+    pub fn snapshot(dir: &Path) -> Result<Self> {
+        let mut paths = Vec::new();
+        walk(dir, &mut paths)?;
+        let files = paths
+            .into_iter()
+            .map(|p| {
+                let bytes =
+                    std::fs::read(&p).with_context(|| format!("reading {}", p.display()))?;
+                Ok((p, bytes))
+            })
+            .collect::<Result<_>>()?;
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            files,
+        })
+    }
+
+    /// Put each file back, and remove files that were not there.
+    fn apply(&self) -> Result<bool> {
+        let mut changed = false;
+        for (path, bytes) in &self.files {
+            if std::fs::read(path).ok().as_deref() != Some(bytes.as_slice()) {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                write_atomic(path, bytes)?;
+                changed = true;
+            }
+        }
+        let mut now = Vec::new();
+        walk(&self.dir, &mut now)?;
+        for path in now {
+            if !self.files.iter().any(|(p, _)| *p == path) {
+                std::fs::remove_file(&path)
+                    .with_context(|| format!("removing {}", path.display()))?;
+                changed = true;
+            }
+        }
+        Ok(changed)
+    }
 }
 
 impl Restore {
     /// Put the files back; returns whether anything had changed.
     pub fn apply(&self) -> Result<bool> {
-        let mut changed = false;
+        let mut changed = match &self.tree {
+            Some(tree) => tree.apply()?,
+            None => false,
+        };
         if std::fs::read(&self.lock_path).ok().as_deref() != Some(self.lock.as_slice()) {
             write_atomic(&self.lock_path, &self.lock)?;
             changed = true;
@@ -84,7 +158,7 @@ fn running(pid: u32) -> bool {
 }
 
 /// Ask every tracked nix to stop and wait for them (up to ten seconds), so
-/// none writes flake.lock after it was restored.
+/// none writes the lock after it was restored.
 fn stop_children() {
     let pids: Vec<u32> = CHILDREN.lock().map(|c| c.clone()).unwrap_or_default();
     for pid in &pids {
@@ -128,7 +202,7 @@ fn restore_and_exit() -> ! {
     let mut armed = ARMED.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(r) = armed.take() {
         match r.apply() {
-            Ok(_) => log::change("interrupted; restored flake.lock and pins.json"),
+            Ok(_) => log::change(&format!("interrupted; restored {}", crate::locker::files())),
             Err(e) => log::warn(&format!("interrupted; restoring failed: {e:#}")),
         }
     }
@@ -212,9 +286,12 @@ pub fn restore_after_panic() {
         && let Some(r) = armed.take()
     {
         match r.apply() {
-            Ok(true) => log::change("restored flake.lock and pins.json"),
+            Ok(true) => log::change(&format!("restored {}", crate::locker::files())),
             Ok(false) => {}
-            Err(e) => log::warn(&format!("restoring flake.lock and pins.json failed: {e:#}")),
+            Err(e) => log::warn(&format!(
+                "restoring {} failed: {e:#}",
+                crate::locker::files()
+            )),
         }
     }
 }
@@ -236,7 +313,7 @@ pub fn restore() -> Result<()> {
     if let Some(r) = taken
         && r.apply()?
     {
-        log::change("restored flake.lock and pins.json");
+        log::change(&format!("restored {}", crate::locker::files()));
     }
     Ok(())
 }

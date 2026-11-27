@@ -7,6 +7,7 @@ mod graph;
 mod guard;
 mod inputs;
 mod lock;
+mod locker;
 mod log;
 mod logparse;
 mod nix;
@@ -14,6 +15,7 @@ mod pins;
 mod resolve;
 mod state;
 mod summary;
+mod tack;
 
 use clap::{Parser, Subcommand};
 use std::process::ExitCode;
@@ -68,14 +70,19 @@ enum Command {
         #[command(flatten)]
         build: cmd::BuildArgs,
     },
-    /// Run nix flake update, keeping a pinned flake input where it is until
-    /// its upstream has a new revision to try.
+    /// Run nix flake update (tack update for a flake pinned with tack),
+    /// keeping a pinned input where it is until its upstream has a new
+    /// revision to try.
     Update,
     /// List the pins and held hosts and homes, with their age.
     Status {
         /// Print a JSON summary for dashboards and scripts instead.
         #[arg(long)]
         json: bool,
+        /// Also show how far each tack pin is behind upstream, from 'tack
+        /// look' (fetches from every pin's upstream).
+        #[arg(long, conflicts_with = "json")]
+        look: bool,
     },
     /// Show why a package is pinned: the build that failed, how it leads to
     /// the package, and the end of its build log.
@@ -97,7 +104,7 @@ enum Command {
         /// The input to pin it in; defaults to programs.eppur.input.
         #[arg(long, value_name = "INPUT")]
         input: Option<String>,
-        /// Pin it at the input's revision in this flake.lock instead of the
+        /// Pin it at the input's revision in this lock file instead of the
         /// current one, e.g. one from git history, for a package that builds
         /// but misbehaves.
         #[arg(long, value_name = "FILE")]
@@ -141,7 +148,8 @@ enum Command {
         /// with the current lock.
         #[arg(long, conflicts_with_all = ["attr", "input"])]
         held: bool,
-        /// Remove the pin of this flake input instead. flake.lock stays as it
+        /// Remove the pin of this flake input (or tack pin, which eppur then
+        /// unfreezes) instead. The lock stays as it
         /// is until the next update moves the input; if it still fails then,
         /// it is pinned again.
         #[arg(long, value_name = "INPUT", conflicts_with_all = ["attr", "input", "held"])]
@@ -173,7 +181,7 @@ fn main() -> ExitCode {
         Command::Boot { build } => cmd::reconcile(at, build, cmd::Activation::Boot),
         Command::Update => cmd::update(at),
         Command::Merge { file } => cmd::merge(at, file),
-        Command::Status { json } => cmd::status(at, *json),
+        Command::Status { json, look } => cmd::status(at, *json, *look),
         Command::Why { pick, attr } => cmd::why(at, pick, attr),
         Command::Pin {
             pick,
@@ -205,7 +213,7 @@ fn main() -> ExitCode {
         log::flush_nix_errors();
         log::error(&format!("{e:#}"));
         if let Err(e) = guard::restore() {
-            log::error(&format!("restoring flake.lock and pins.json failed: {e:#}"));
+            log::error(&format!("restoring {} failed: {e:#}", locker::files()));
         }
         ExitCode::from(2)
     })

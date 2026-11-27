@@ -18,10 +18,16 @@ impl Lock {
 
     pub fn from_bytes(bytes: Vec<u8>) -> Result<Self> {
         let json: Value = serde_json::from_slice(&bytes)?;
-        if !json["nodes"].is_object() {
-            bail!("not a flake.lock: no nodes");
+        if json["nodes"].is_object() {
+            return Ok(Self { bytes, json });
         }
-        Ok(Self { bytes, json })
+        match crate::tack::as_flake_lock(&json) {
+            Some(json) => {
+                crate::tack::remember(&bytes);
+                Ok(Self { bytes, json })
+            }
+            None => bail!("not a flake.lock (no nodes) or a tack pins.lock.json"),
+        }
     }
 
     pub fn from_json(json: &Value) -> Result<Self> {
@@ -146,7 +152,15 @@ impl Lock {
 
     /// Whether a root input is locked in its own right, not a `follows`.
     pub fn is_direct(&self, input: &str) -> bool {
-        self.json["nodes"][self.root()]["inputs"][input].is_string()
+        match &self.json["nodes"][self.root()]["inputs"][input] {
+            Value::String(node) => self.json["nodes"][node]["tackFollows"] != true,
+            _ => false,
+        }
+    }
+
+    /// Whether this lock was read from a tack pins.lock.json.
+    pub fn is_tack(&self) -> bool {
+        self.json["root"] == crate::tack::ROOT
     }
 
     pub fn nar_hash(&self, input: &str) -> Option<String> {

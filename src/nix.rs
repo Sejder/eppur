@@ -111,6 +111,12 @@ fn run(mut cmd: Command, what: &str) -> Result<Output> {
     out.with_context(|| format!("waiting for {what}"))
 }
 
+/// Run another program the way nix commands run, so an interrupt or
+/// --timeout stops it too.
+pub fn run_command(cmd: Command, what: &str) -> Result<Output> {
+    run(cmd, what)
+}
+
 /// Run a nix command with internal-json logging, handing each line of its
 /// stderr to `on_line`, and collect its stdout and error messages.
 fn run_logged(
@@ -314,6 +320,10 @@ impl Nix {
         }
     }
 
+    pub fn flake_dir(&self) -> &Path {
+        Path::new(&self.flake)
+    }
+
     fn installable(&self, attr: &str) -> String {
         format!("{}#{}", self.flake, attr)
     }
@@ -353,23 +363,33 @@ impl Nix {
         Ok(())
     }
 
-    /// The drv of `attr` as flake.lock has it, or with one input at another
-    /// revision, without touching flake.lock; Err with nix's message when it
-    /// does not evaluate.
+    /// The drv of `attr` as the lock has it, or with one input at another
+    /// revision (a lock node's `locked`), leaving the lock as it is; Err with
+    /// nix's message when it does not evaluate. Under tack, which has no
+    /// --override-input, the lock is changed for the evaluation and put back.
     pub fn drv_path_with(
         &self,
         attr: &str,
-        input: Option<(&str, &str)>,
+        input: Option<(&str, &Value)>,
     ) -> Result<Result<String, String>> {
+        if let Some((name, locked)) = input
+            && crate::locker::is_tack()
+        {
+            let lock_path = crate::locker::Locker::Tack.lock_path(Path::new(&self.flake));
+            return crate::tack::with_pin_at(&lock_path, name, locked, || {
+                self.drv_path_with(attr, None)
+            });
+        }
+        let flake_ref = input.map(|(_, locked)| flake_ref(locked)).transpose()?;
         let attempt = |cache: bool| -> Result<Result<String, String>> {
             let mut cmd = command();
-            match input {
-                Some((name, flake_ref)) => {
+            match (input, &flake_ref) {
+                (Some((name, _)), Some(flake_ref)) => {
                     cmd.args(["eval", "--raw", "--no-write-lock-file"])
                         .args(["--override-input", name, flake_ref])
                         .arg(self.installable(&format!("{attr}.drvPath")));
                 }
-                None => {
+                _ => {
                     cmd.args(["path-info", "--derivation"])
                         .args(uncached(cache))
                         .arg(self.installable(attr));
@@ -664,6 +684,14 @@ pub fn flake_ref(locked: &Value) -> Result<String> {
         .as_str()
         .map(str::to_string)
         .context("builtins.flakeRefToString did not return a string")
+}
+
+/// Like `eval_expr`, for an expression that reads files outside the store.
+pub fn eval_expr_impure(expr: &str) -> Result<Value> {
+    let mut cmd = command();
+    cmd.args(["eval", "--json", "--impure", "--expr", expr]);
+    let bytes = checked("nix eval --expr", run(cmd, "nix eval")?)?;
+    Ok(serde_json::from_slice(&bytes)?)
 }
 
 pub fn eval_expr(expr: &str) -> Result<Value> {

@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+- Flakes pinned with [tack](https://github.com/manic-systems/tack) are
+  supported. eppur reads `.tack/pins.lock.json` as the lock, so packages are
+  pinned to a tack pin's last good revision as they are to a flake input's,
+  and uses tack to do the rest: `--update` runs `tack update` (and takes
+  tack's groups), a pin that breaks the build is put back and frozen in
+  `pins.toml` with `tack freeze` (recorded as `tackFrozen` in `pins.json`) and
+  unfrozen once it builds, a lock that changed outside `tack update` is
+  checked with `tack verify` when pins name signers, patched trees missing
+  from the store are built with `tack materialize`, and `eppur status --look`
+  shows `tack look`. Pins frozen by hand are left alone. New options
+  `programs.eppur.locker` (`auto`, `flake` or `tack`; `--locker`) and
+  `programs.eppur.tack.package`. A flake that locks inputs in both
+  `flake.lock` and tack is refused under tack. See "Pinned with tack" in the
+  README.
+
 ## 0.2.2
 
 - A pin for a failed build is retried at once when the output of the

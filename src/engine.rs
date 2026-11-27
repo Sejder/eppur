@@ -362,7 +362,8 @@ impl Engine {
         for donor in &self.donors {
             if self.new_lock.locked(donor).is_none() {
                 log::warn(&format!(
-                    "donor {donor} is not an input of flake.lock, so nothing is pinned to it"
+                    "donor {donor} is not an input of {}, so nothing is pinned to it",
+                    crate::locker::lock_name()
                 ));
             }
         }
@@ -513,6 +514,35 @@ impl Engine {
         excluded.extend(states.iter().flat_map(|st| st.inputs.iter().cloned()));
         // What other inputs follow is a base they all share, such as nixpkgs.
         excluded.extend(self.new_lock.followed());
+        let mut hand_frozen: BTreeSet<String> = BTreeSet::new();
+        if crate::locker::is_tack() {
+            let pins = crate::tack::Pins::read(self.nix.flake_dir())?;
+            excluded.extend(pins.followed.iter().cloned());
+            // A patched pin's tree is built from its patches: back at another
+            // revision they may not apply.
+            excluded.extend(
+                pins.pins
+                    .iter()
+                    .filter(|(_, p)| p.patched)
+                    .map(|(n, _)| n.clone()),
+            );
+            // A pin frozen by hand is where its owner wants it.
+            hand_frozen.extend(
+                pins.pins
+                    .iter()
+                    .filter(|(n, p)| {
+                        p.frozen.is_some()
+                            && original
+                                .inputs
+                                .get(*n)
+                                .and_then(|i| i.tack_frozen.as_deref())
+                                != p.frozen.as_deref()
+                    })
+                    .map(|(n, _)| n.clone()),
+            );
+            excluded.extend(hand_frozen.iter().cloned());
+        }
+        let mut told: BTreeSet<String> = BTreeSet::new();
         let mut found: BTreeMap<String, Rollback> = BTreeMap::new();
         // The input found for a failed drv or evaluation error: the answer is
         // the same for every target that has it, and each test evaluates a
@@ -528,6 +558,14 @@ impl Engine {
             // A held target's last good lock is the one it is held on: the
             // published lock may have moved on to the broken revision.
             let good = st.held_lock.as_ref().unwrap_or(&st.old_lock);
+            for name in &hand_frozen {
+                if good.nar_hash(name) != self.new_lock.nar_hash(name) && told.insert(name.clone())
+                {
+                    log::info(&format!(
+                        "tack pin {name} is frozen by hand in pins.toml, so it is not rolled back"
+                    ));
+                }
+            }
             let mut candidates =
                 inputs::candidates(good, &self.new_lock, &excluded, &self.input_deny);
             // A retried pin knows where it last built, whatever the old lock says.
@@ -727,10 +765,9 @@ impl Engine {
             describe(locked)
         ));
         let result = (|| -> Result<bool> {
-            let flake_ref = crate::nix::flake_ref(locked)?;
             let drv = match self
                 .nix
-                .drv_path_with(&st.target.output(), Some((input, &flake_ref)))?
+                .drv_path_with(&st.target.output(), Some((input, locked)))?
             {
                 Ok(drv) => drv,
                 Err(_) => return Ok(false),
@@ -1213,15 +1250,21 @@ impl Engine {
             None => bail!("programs.eppur.pinsFile is not set in {target}"),
             Some(Some(rel)) if rel == self.pins_rel => {}
             Some(rel) => bail!(
-                "{target} has programs.eppur.pinsFile = {}; it must be {}, the pins.json next to flake.lock, where eppur writes it",
+                "{target} has programs.eppur.pinsFile = {}; it must be {}, the pins.json {}, where eppur writes it",
                 rel.unwrap_or_else(|| probe.pins.clone().unwrap_or_default()),
-                self.pins_rel
+                self.pins_rel,
+                if crate::locker::is_tack() {
+                    "at the root of the flake"
+                } else {
+                    "next to flake.lock"
+                }
             ),
         }
         for set in &probe.sets {
             if self.new_lock.locked(set).is_none() {
                 log::warn(&format!(
-                    "{target}: package set {set} is not an input of flake.lock, so its packages cannot be pinned"
+                    "{target}: package set {set} is not an input of {}, so its packages cannot be pinned",
+                    crate::locker::lock_name()
                 ));
             }
         }

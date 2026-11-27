@@ -165,7 +165,8 @@ in
       environment.systemPackages = [
         cfg.package
       ]
-      ++ lib.optional (cfg.switcher == "nh" && !(config.programs.nh.enable or false)) pkgs.nh;
+      ++ lib.optional (cfg.switcher == "nh" && !(config.programs.nh.enable or false)) pkgs.nh
+      ++ lib.optional (cfg.tack.package != null) cfg.tack.package;
       environment.etc."eppur.json".text = builtins.toJSON {
         kind = "nixos";
         self = cfg.name;
@@ -178,6 +179,7 @@ in
           quiet
           commit
           switcher
+          locker
           input
           donors
           inputDeny
@@ -218,6 +220,10 @@ in
           pkgs.git
           pkgs.coreutils
           config.programs.ssh.package
+        ]
+        ++ lib.optionals (cfg.tack.package != null) [
+          cfg.tack.package
+          pkgs.gnupg
         ];
         environment = {
           EPPUR_CONFIG = "/etc/eppur.json";
