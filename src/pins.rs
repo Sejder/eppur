@@ -232,6 +232,11 @@ pub struct InputPin {
     /// one, or the failed one when `locked` could not be put back.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub retrying: bool,
+    /// Under tack, the `frozen` eppur wrote for this pin in pins.toml ("true"
+    /// or a commit): eppur only unfreezes a pin still frozen at that, never
+    /// one frozen by hand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tack_frozen: Option<String>,
 }
 
 impl InputPin {
@@ -534,6 +539,7 @@ mod tests {
             error: None,
             targets: vec!["host a".into()],
             retrying: false,
+            tack_frozen: None,
         }
     }
 

@@ -87,8 +87,9 @@ pub fn input_targets(pin: &InputPin) -> String {
 pub fn input_state(pin: &InputPin) -> String {
     if pin.retrying {
         format!(
-            "last good {}, flake.lock has another revision to try",
-            describe(&pin.locked)
+            "last good {}, {} has another revision to try",
+            describe(&pin.locked),
+            crate::locker::lock_name()
         )
     } else {
         format!("kept at {}", describe(&pin.locked))
@@ -532,6 +533,7 @@ mod tests {
             error: None,
             targets: vec!["host pi".into()],
             retrying: false,
+            tack_frozen: None,
         }
     }
 

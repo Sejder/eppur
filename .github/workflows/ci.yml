@@ -29,6 +29,12 @@ jobs:
           git config --global user.name ci
           git config --global user.email ci@localhost
           EPPUR="$PWD/result/bin/eppur" tests/e2e.sh
+      - name: end to end with tack
+        run: |
+          nix build -L github:manic-systems/tack --out-link tack \
+            --option extra-substituters https://cache.manic.systems \
+            --option extra-trusted-public-keys cache.manic.systems-1:s6OZanN8Us8vRi0jVivP3qlMn0cYHBjBALKrNe5nH8s=
+          EPPUR="$PWD/result/bin/eppur" TACK="$PWD/tack/bin/tack" tests/e2e-tack.sh
 
   compat:
     name: e2e on ${{ matrix.name }}

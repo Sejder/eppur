@@ -125,7 +125,8 @@ in
       home.packages = [
         cfg.package
       ]
-      ++ lib.optional (cfg.switcher == "nh" && !(config.programs.nh.enable or false)) pkgs.nh;
+      ++ lib.optional (cfg.switcher == "nh" && !(config.programs.nh.enable or false)) pkgs.nh
+      ++ lib.optional (cfg.tack.package != null) cfg.tack.package;
       xdg.configFile."eppur.json".text = builtins.toJSON {
         kind = "home";
         self = cfg.name;
@@ -138,6 +139,7 @@ in
           quiet
           commit
           switcher
+          locker
           input
           donors
           inputDeny
@@ -179,10 +181,13 @@ in
           Type = "oneshot";
           Environment = [
             "PATH=${config.home.profileDirectory}/bin:${
-              lib.makeBinPath [
-                pkgs.git
-                pkgs.openssh
-              ]
+              lib.makeBinPath (
+                [
+                  pkgs.git
+                  pkgs.openssh
+                ]
+                ++ lib.optional (cfg.tack.package != null) pkgs.gnupg
+              )
             }:/run/current-system/sw/bin:/nix/var/nix/profiles/default/bin:/usr/bin:/bin"
             "EPPUR_CONFIG=${config.xdg.configHome or "${config.home.homeDirectory}/.config"}/eppur.json"
           ];

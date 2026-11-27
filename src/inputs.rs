@@ -1,4 +1,4 @@
-//! Flake inputs held back in flake.lock. A package from a flake input other
+//! Flake inputs held back in the lock (flake.lock, or tack's pins.lock.json). A package from a flake input other
 //! than a package set never passes through the overlay, so it cannot be pinned
 //! the way a nixpkgs package is. The lock has one revision per input, so an
 //! input that breaks a build goes back to the revision it last built with for
@@ -115,16 +115,21 @@ pub fn denied(input: &str, deny: &[String]) -> bool {
 }
 
 fn set_lock(nix: &Nix, lock_path: &Path, wanted: &[(String, Value)]) -> Result<()> {
-    let refs: Vec<(String, String)> = wanted
-        .iter()
-        .map(|(name, locked)| Ok((name.clone(), crate::nix::flake_ref(locked)?)))
-        .collect::<Result<_>>()?;
-    nix.lock_override(&refs)?;
+    if crate::locker::is_tack() {
+        crate::tack::set(lock_path, wanted)?;
+    } else {
+        let refs: Vec<(String, String)> = wanted
+            .iter()
+            .map(|(name, locked)| Ok((name.clone(), crate::nix::flake_ref(locked)?)))
+            .collect::<Result<_>>()?;
+        nix.lock_override(&refs)?;
+    }
     let lock = Lock::load(lock_path)?;
     for (name, locked) in wanted {
         if lock.nar_hash(name).as_deref() != locked["narHash"].as_str() {
             bail!(
-                "flake.lock does not have {name} at {} after locking it there",
+                "{} does not have {name} at {} after locking it there",
+                crate::locker::lock_name(),
                 describe(locked)
             );
         }
@@ -210,7 +215,7 @@ pub fn settle(
     Ok(())
 }
 
-/// Take the inputs back in flake.lock and record the pins. `built` are the
+/// Take the inputs back in the lock and record the pins. `built` are the
 /// targets that built in the run that found the rollbacks. Returns one line
 /// per input for the run's changes.
 pub fn apply(
@@ -246,6 +251,7 @@ pub fn apply(
             error: r.error.clone(),
             targets,
             retrying: false,
+            tack_frozen: existing.and_then(|p| p.tack_frozen.clone()),
         };
         log::change(&format!(
             "pinned input {} at {}: {}; breaks {}",
@@ -297,6 +303,7 @@ mod tests {
             error: None,
             targets: vec!["host a".into()],
             retrying: false,
+            tack_frozen: None,
         }
     }
 

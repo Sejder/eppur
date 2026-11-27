@@ -5,6 +5,7 @@ use crate::git::Git;
 use crate::guard;
 use crate::inputs;
 use crate::lock::Lock;
+use crate::locker::{self, Locker};
 use crate::log;
 use crate::nix::{self, Nix};
 use crate::pins::{Kind, Pin, PinsFile, Reason};
@@ -65,6 +66,17 @@ pub struct Where {
         help_heading = "Global options"
     )]
     pub flake: Option<PathBuf>,
+    /// What locks the flake's inputs: flake.lock, or tack's pins (by
+    /// default programs.eppur.locker, which picks tack when the flake has
+    /// .tack/pins.toml).
+    #[arg(
+        long,
+        global = true,
+        value_enum,
+        value_name = "LOCKER",
+        help_heading = "Global options"
+    )]
+    pub locker: Option<locker::Choice>,
 }
 
 #[derive(clap::Args)]
@@ -192,6 +204,9 @@ struct Ctx {
     flake: PathBuf,
     /// Where the flake directory came from, for error messages.
     source: String,
+    /// Why the locker asked for cannot work on this flake, for the commands
+    /// that write.
+    locker_error: Option<String>,
 }
 
 impl Ctx {
@@ -248,24 +263,48 @@ impl Ctx {
                 )));
             }
         };
+        let choice = at
+            .locker
+            .or_else(|| config.as_ref().map(|c| c.locker))
+            .unwrap_or_default();
+        let locker_error = match locker::detect(&flake, choice) {
+            Ok(l) => {
+                locker::set(l);
+                None
+            }
+            Err(e) => {
+                locker::set(Locker::Flake);
+                Some(format!("{e:#}"))
+            }
+        };
         Ok(Self {
             config,
             config_path,
             flake,
             source,
+            locker_error,
         })
+    }
+
+    fn lock_path(&self) -> PathBuf {
+        locker::current().lock_path(&self.flake)
     }
 
     /// Which flake and config a command acts on, said first, since both can
     /// come from far away (/etc/eppur.json from any directory).
     fn announce(&self) {
+        let tack = if locker::is_tack() {
+            ", pinned with tack"
+        } else {
+            ""
+        };
         match &self.config_path {
             Some(c) => log::info(&format!(
-                "flake {} (config {})",
+                "flake {}{tack} (config {})",
                 self.flake.display(),
                 c.display()
             )),
-            None => log::info(&format!("flake {}", self.flake.display())),
+            None => log::info(&format!("flake {}{tack}", self.flake.display())),
         }
     }
 
@@ -443,7 +482,8 @@ fn activate(
         return Ok(0);
     }
     log::warn(&format!(
-        "{program} failed ({status}); {target} built, flake.lock and pins.json kept"
+        "{program} failed ({status}); {target} built, {} kept",
+        locker::files()
     ));
     Ok(4)
 }
@@ -578,7 +618,18 @@ fn remove_link(link: &Path) -> Result<()> {
 fn check_flake(ctx: &Ctx) -> Result<()> {
     use std::os::unix::fs::MetadataExt;
     let flake = ctx.flake.as_path();
-    if !flake.join("flake.lock").is_file() {
+    if let Some(e) = &ctx.locker_error {
+        bail!("{e}");
+    }
+    if locker::is_tack() {
+        if !ctx.lock_path().is_file() {
+            bail!(
+                "no .tack/pins.lock.json in {} ({}); run tack update there",
+                flake.display(),
+                ctx.source
+            );
+        }
+    } else if !flake.join("flake.lock").is_file() {
         bail!(
             "no flake.lock in {} ({}); eppur needs a locked flake: {}run nix flake lock there",
             flake.display(),
@@ -615,7 +666,86 @@ fn check_flake(ctx: &Ctx) -> Result<()> {
     Ok(())
 }
 
-/// What became of flake.lock and pins.json, for the closing line.
+/// Refuse --update names the lock does not have: flake inputs, or tack's
+/// pins and groups.
+fn check_update_names(ctx: &Ctx, names: &[String], lock: &[u8]) -> Result<()> {
+    let (known, what) = if locker::is_tack() {
+        let pins = crate::tack::Pins::read(&ctx.flake)?;
+        (
+            pins.names(),
+            "a pin or group of .tack/pins.toml (its pins and groups",
+        )
+    } else {
+        let mut known = Lock::from_bytes(lock.to_vec())
+            .with_context(|| format!("parsing {}", ctx.lock_path().display()))?
+            .inputs();
+        known.sort();
+        (known, "an input of flake.lock (its inputs")
+    };
+    let unknown: Vec<&str> = names
+        .iter()
+        .filter(|n| !known.contains(n))
+        .map(String::as_str)
+        .collect();
+    if !unknown.is_empty() {
+        bail!(
+            "--update {}: not {what}: {})",
+            unknown.join(", "),
+            known.join(", ")
+        );
+    }
+    Ok(())
+}
+
+/// Update the lock: `nix flake update`, or `tack update`, which checks the
+/// commits it locks against the signers pins.toml names. `inputs` are inputs
+/// (or tack pins and groups) to update, or none for all.
+fn update_lock(nix: &Nix, flake: &Path, pins_path: &Path, inputs: &[String]) -> Result<()> {
+    if !locker::is_tack() {
+        return nix.flake_update(inputs);
+    }
+    crate::tack::update(flake, pins_path, inputs)
+}
+
+/// Under tack, freeze the pins pins.json holds back and unfreeze those it
+/// let go of since `before`, and say so; returns what it said.
+fn sync_freezes(flake: &Path, pins_path: &Path, before: &PinsFile) -> Result<Vec<String>> {
+    if !locker::is_tack() {
+        return Ok(Vec::new());
+    }
+    let lines = crate::tack::sync_freezes(flake, pins_path, before)?;
+    for line in &lines {
+        log::change(line);
+    }
+    Ok(lines)
+}
+
+/// The files a run writes, to check for changes and commit: the lock (under
+/// tack, the files of its directory eppur may change, those git tracks) and
+/// pins.json.
+fn written(flake: &Path, git: &Git, lock_path: &Path, pins_path: &Path) -> Vec<PathBuf> {
+    let mut paths = if locker::is_tack() {
+        crate::tack::files(flake)
+            .into_iter()
+            .filter(|p| git.tracked(p))
+            .collect()
+    } else {
+        vec![lock_path.to_path_buf()]
+    };
+    paths.push(pins_path.to_path_buf());
+    paths
+}
+
+/// Under tack, its directory as it is, for the guard to put back: tack's
+/// commands change pins.toml and the patches as well as the lock.
+fn tack_tree(flake: &Path) -> Result<Option<guard::Tree>> {
+    if !locker::is_tack() {
+        return Ok(None);
+    }
+    guard::Tree::snapshot(&locker::tack_dir(flake)).map(Some)
+}
+
+/// What became of the lock and pins.json, for the closing line.
 enum Closing {
     NoRepository { commit: bool },
     Unchanged,
@@ -641,10 +771,10 @@ impl std::fmt::Display for Closing {
                 f.write_str("the flake is not in a git repository, so nothing was committed")
             }
             Closing::NoRepository { commit: false } => {
-                f.write_str("flake.lock and pins.json are not in a git repository")
+                write!(f, "{} are not in a git repository", locker::files())
             }
-            Closing::Unchanged => f.write_str("flake.lock and pins.json unchanged"),
-            Closing::Uncommitted => f.write_str("flake.lock and pins.json uncommitted"),
+            Closing::Unchanged => write!(f, "{} unchanged", locker::files()),
+            Closing::Uncommitted => write!(f, "{} uncommitted", locker::files()),
             Closing::Committed(what) => write!(f, "committed {what}"),
         }
     }
@@ -893,27 +1023,11 @@ fn reconcile_run(
 
     let git = Git::open(&ctx.flake);
     let pins_path = ctx.pins_path();
-    let lock_path = ctx.flake.join("flake.lock");
+    let lock_path = ctx.lock_path();
     let orig_lock =
         std::fs::read(&lock_path).with_context(|| format!("reading {}", lock_path.display()))?;
     if let Some(names) = update {
-        let known = Lock::from_bytes(orig_lock.clone())
-            .with_context(|| format!("parsing {}", lock_path.display()))?
-            .inputs();
-        let unknown: Vec<&str> = names
-            .iter()
-            .filter(|n| !known.contains(n))
-            .map(String::as_str)
-            .collect();
-        if !unknown.is_empty() {
-            let mut known = known;
-            known.sort();
-            bail!(
-                "--update {}: not an input of flake.lock (its inputs: {})",
-                unknown.join(", "),
-                known.join(", ")
-            );
-        }
+        check_update_names(&ctx, names, &orig_lock)?;
     }
     if !args.dry_run
         && let Some(link) = &args.built_link
@@ -926,6 +1040,11 @@ fn reconcile_run(
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
         Err(e) => return Err(e).with_context(|| format!("reading {}", pins_path.display())),
     };
+    let pins_start = pins_before
+        .as_deref()
+        .map(PinsFile::parse)
+        .transpose()?
+        .unwrap_or_default();
     let (created_pins, indexed) = ensure_pins(&pins_path, git.as_ref(), args.dry_run)?;
     guard::arm(guard::Restore {
         lock_path: lock_path.clone(),
@@ -934,6 +1053,7 @@ fn reconcile_run(
         pins: if created_pins { None } else { pins_before },
         untrack: indexed,
         flake: ctx.flake.clone(),
+        tree: tack_tree(&ctx.flake)?,
     });
 
     // Any error from here on is restored by main, after it is printed.
@@ -979,7 +1099,7 @@ fn reconcile_run(
         guard::deadline(limit);
     }
     if let Some(inputs) = update {
-        nix.flake_update(inputs)?;
+        update_lock(&nix, &ctx.flake, &pins_path, inputs)?;
     }
     let building: Vec<String> = targets.iter().map(|t| t.to_string()).collect();
     inputs::settle(
@@ -991,6 +1111,12 @@ fn reconcile_run(
     )?;
     if update.is_some() {
         inputs::report_update(&Lock::from_bytes(orig_lock.clone())?, &lock_path)?;
+    }
+    if locker::is_tack() {
+        if update.is_none() {
+            crate::tack::verify_changed(&ctx.flake)?;
+        }
+        crate::tack::materialize(&ctx.flake)?;
     }
 
     let host_names = nix.output_names("nixosConfigurations");
@@ -1097,30 +1223,43 @@ fn reconcile_run(
                 dir.display()
             ));
         }
+        let freezes = sync_freezes(&ctx.flake, &pins_path, &pins_start)?;
         guard::settle(|| {
             let commit = (cfg.commit || args.commit) && !args.no_commit;
             let Some(git) = &git else {
                 return Ok(Closing::NoRepository { commit });
             };
-            if !git.changed(&[&lock_path, &pins_path])? {
+            let paths = written(&ctx.flake, git, &lock_path, &pins_path);
+            let paths: Vec<&Path> = paths.iter().map(PathBuf::as_path).collect();
+            if !git.changed(&paths)? {
                 return Ok(Closing::Unchanged);
             }
             if !commit {
                 return Ok(Closing::Uncommitted);
             }
             {
-                let title = if git.changed(&[&lock_path])? {
-                    "eppur: update flake.lock"
-                } else {
-                    "eppur: update pins"
+                let lock_files: Vec<&Path> = paths
+                    .iter()
+                    .copied()
+                    .filter(|p| *p != pins_path.as_path())
+                    .collect();
+                let title = match (git.changed(&lock_files)?, locker::is_tack()) {
+                    (true, false) => "eppur: update flake.lock",
+                    (true, true) => "eppur: update tack pins",
+                    (false, _) => "eppur: update pins",
                 };
                 let mut message = title.to_string();
-                if !report.changes.is_empty() {
+                let lines: Vec<String> = report
+                    .changes
+                    .iter()
+                    .map(Change::to_string)
+                    .chain(freezes.iter().cloned())
+                    .collect();
+                if !lines.is_empty() {
                     message.push_str("\n\n");
-                    let lines: Vec<String> = report.changes.iter().map(Change::to_string).collect();
                     message.push_str(&lines.join("\n"));
                 }
-                if git.commit(&[&lock_path, &pins_path], &message)? {
+                if git.commit(&paths, &message)? {
                     return Ok(Closing::Committed(match git.head() {
                         Some(h) => format!("{h} {title:?}"),
                         None => format!("{title:?}"),
@@ -1208,7 +1347,7 @@ pub fn update(at: &Where) -> Result<ExitCode> {
     ctx.announce();
     check_flake(&ctx)?;
     let _run_lock = guard::lock_flake(&ctx.flake)?;
-    let lock_path = ctx.flake.join("flake.lock");
+    let lock_path = ctx.lock_path();
     let pins_path = ctx.pins_path();
     let deny = ctx
         .config
@@ -1222,6 +1361,11 @@ pub fn update(at: &Where) -> Result<ExitCode> {
         Err(e) => return Err(e).with_context(|| format!("reading {}", pins_path.display())),
     };
     let before = Lock::from_bytes(lock.clone())?;
+    let pins_start = pins
+        .as_deref()
+        .map(PinsFile::parse)
+        .transpose()?
+        .unwrap_or_default();
     guard::arm(guard::Restore {
         lock_path: lock_path.clone(),
         lock,
@@ -1229,11 +1373,13 @@ pub fn update(at: &Where) -> Result<ExitCode> {
         pins,
         untrack: false,
         flake: ctx.flake.clone(),
+        tree: tack_tree(&ctx.flake)?,
     });
     let nix = Nix::new(&ctx.flake);
-    nix.flake_update(&[])?;
+    update_lock(&nix, &ctx.flake, &pins_path, &[])?;
     inputs::settle(&nix, &lock_path, &pins_path, &deny, None)?;
     inputs::report_update(&before, &lock_path)?;
+    sync_freezes(&ctx.flake, &pins_path, &pins_start)?;
     guard::settle(|| Ok(()))?;
     Ok(ExitCode::SUCCESS)
 }
@@ -1252,6 +1398,15 @@ pub fn merge(at: &Where, other: &Path) -> Result<ExitCode> {
             other.display()
         );
     }
+    if raw.get("version").is_none()
+        && raw.as_object().is_some_and(|o| !o.is_empty())
+        && crate::tack::as_flake_lock(&raw).is_some()
+    {
+        bail!(
+            "{} is a tack pins.lock.json, not a pins.json; merge takes another pins.json",
+            other.display()
+        );
+    }
     if raw.get("version").is_none() {
         bail!("{} is not an eppur pins file (no version)", other.display());
     }
@@ -1260,9 +1415,7 @@ pub fn merge(at: &Where, other: &Path) -> Result<ExitCode> {
     let pins_path = ctx.pins_path();
     ensure_pins(&pins_path, Git::open(&ctx.flake).as_ref(), false)?;
     let mut file = PinsFile::load(&pins_path)?;
-    let lock_sha256 = Lock::load(&ctx.flake.join("flake.lock"))
-        .ok()
-        .map(|l| l.sha256());
+    let lock_sha256 = Lock::load(&ctx.lock_path()).ok().map(|l| l.sha256());
     let mut taken = 0;
     for (kind, name, entry) in incoming.entries() {
         let target = Target::new(kind, name);
@@ -1308,8 +1461,29 @@ fn reason_words(pin: &Pin) -> &'static str {
     }
 }
 
-pub fn status(at: &Where, json: bool) -> Result<ExitCode> {
+pub fn status(at: &Where, json: bool, look: bool) -> Result<ExitCode> {
     let ctx = Ctx::open(at, false)?;
+    if look {
+        if let Some(e) = &ctx.locker_error {
+            bail!("{e}");
+        }
+        if !locker::is_tack() {
+            bail!("--look shows what tack look sees upstream; this flake is not pinned with tack");
+        }
+    }
+    let code = status_table(&ctx, json)?;
+    if look {
+        let text = crate::tack::output(&ctx.flake, &["look"])?;
+        println!();
+        println!("upstream, as tack look sees it:");
+        for line in text.lines().filter(|l| !l.trim().is_empty()) {
+            println!("  {line}");
+        }
+    }
+    Ok(code)
+}
+
+fn status_table(ctx: &Ctx, json: bool) -> Result<ExitCode> {
     let pins_path = ctx.pins_path();
     let file = PinsFile::load(&pins_path)?;
     let today = date::today();
@@ -1412,9 +1586,9 @@ pub fn status(at: &Where, json: bool) -> Result<ExitCode> {
                 "{}{}",
                 crate::summary::input_cause_short(pin),
                 if pin.retrying {
-                    "; flake.lock has another revision to try"
+                    format!("; {} has another revision to try", locker::lock_name())
                 } else {
-                    ""
+                    String::new()
                 }
             ),
             since: format!(
@@ -1475,7 +1649,11 @@ pub fn why(at: &Where, pick: &Pick, attr: &str) -> Result<ExitCode> {
             .entries()
             .any(|(_, _, e)| e.packages().contains_key(attr))
     {
-        println!("flake input {attr} is held back in flake.lock, for the whole flake");
+        println!(
+            "{} {attr} is held back in {}, for the whole flake",
+            locker::input_word(),
+            locker::lock_name()
+        );
         println!("since:     {}", pin.since);
         println!(
             "{}{}",
@@ -1611,12 +1789,13 @@ pub fn pin(
         ),
     };
     let input = input.as_str();
-    let lock = Lock::load(&ctx.flake.join("flake.lock"))?;
+    let lock = Lock::load(&ctx.lock_path())?;
     let Some(current) = lock.locked(input) else {
         let mut known = lock.inputs();
         known.sort();
         bail!(
-            "{input} (from {from}) is not an input of flake.lock (its inputs: {}){}",
+            "{input} (from {from}) is not an input of {} (its inputs: {}){}",
+            locker::lock_name(),
             known.join(", "),
             if from == "--input" {
                 ""
@@ -1819,9 +1998,13 @@ pub fn clear_input(at: &Where, input: &str) -> Result<ExitCode> {
     let _run_lock = guard::lock_flake(&ctx.flake)?;
     let pins_path = ctx.pins_path();
     let mut file = PinsFile::load(&pins_path)?;
-    if file.inputs.remove(input).is_none() {
-        bail!("flake input {input} is not pinned");
+    if !file.inputs.contains_key(input) {
+        bail!("{} {input} is not pinned", locker::input_word());
     }
+    if locker::is_tack() && crate::tack::release(&ctx.flake, &file, input)? {
+        log::change(&format!("unfroze tack pin {input}"));
+    }
+    file.inputs.remove(input);
     file.touch_inputs();
     file.save(&pins_path)?;
     log::change(&format!("unpinned input {input}"));

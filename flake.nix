@@ -147,6 +147,7 @@
                   pinsFile = pins;
                   hosts = [ "test" ];
                   flake = "/home/alice/nixos";
+                  tack.package = pkgs.cowsay;
                   autoUpgrade = {
                     enable = true;
                     user = "alice";
@@ -381,6 +382,9 @@
             assert settings.kind == "nixos";
             assert settings.quiet == false;
             assert settings.switcher == "nh";
+            assert settings.locker == "auto";
+            assert builtins.elem pkgs.cowsay upgrade.path;
+            assert builtins.elem pkgs.cowsay machine.config.environment.systemPackages;
             assert settings.commit == false;
             assert settings.nixArgs == [ ];
             assert settings.evalJobs == 4;
@@ -517,6 +521,7 @@
             );
             assert homeSettings.kind == "home";
             assert homeSettings.self == "alice";
+            assert homeSettings.locker == "auto";
             assert homeSettings.homes == [ "alice" ];
             assert homeSettings.nixArgs == [ ];
             assert homeSettings.evalJobs == 4;

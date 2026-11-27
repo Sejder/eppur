@@ -46,7 +46,7 @@ in
     type = types.str;
     default = defaultInput;
     example = "nixos";
-    description = "The flake input this machine's pkgs come from, as named in flake.lock; pins for pkgs are kept under it.";
+    description = "The flake input this machine's pkgs come from, as named in flake.lock (or the tack pin, under tack); pins for pkgs are kept under it.";
   };
   pinsFile = mkOption {
     type = types.nullOr types.path;
@@ -124,6 +124,21 @@ in
     default = 4;
     description = "How many evaluations eppur runs at once; each holds a whole system in memory, so lower it on a small machine.";
   };
+  locker = mkOption {
+    type = types.enum [
+      "auto"
+      "flake"
+      "tack"
+    ];
+    default = "auto";
+    description = "What locks the flake's inputs: flake.lock, or tack (github:manic-systems/tack) with .tack/pins.toml and .tack/pins.lock.json. auto picks tack when the flake has .tack/pins.toml.";
+  };
+  tack.package = mkOption {
+    type = types.nullOr types.package;
+    default = null;
+    example = lib.literalExpression "inputs.tack.packages.\${pkgs.stdenv.hostPlatform.system}.default";
+    description = "The tack eppur runs on a flake pinned with tack, to update it and to freeze the pins it holds back; installed with eppur. null leaves tack to PATH. eppur also runs it to check signers on a lock that changed outside tack update and to build missing patched trees.";
+  };
   switcher = mkOption {
     type = types.enum [
       "nh"
@@ -154,7 +169,7 @@ in
       type = types.listOf types.str;
       default = [ ];
       example = [ "nixpkgs" ];
-      description = "Flake inputs to update; all of them when empty.";
+      description = "Flake inputs (under tack: pins or groups) to update; all of them when empty.";
     };
     commit = mkOption {
       type = types.nullOr types.bool;

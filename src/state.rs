@@ -72,8 +72,12 @@ pub fn save_last_good_pins(flake: &Path, target: &Target, entry: &Entry) -> Resu
     write_atomic(&path, &bytes)
 }
 
+/// The last lock that built, if it is the current locker's: after a flake
+/// moved to tack (or back), the other one's lock has no inputs in common.
 pub fn load_last_good(flake: &Path, target: Option<&Target>) -> Option<Lock> {
-    Lock::load(&last_good_path(flake, target)?).ok()
+    Lock::load(&last_good_path(flake, target)?)
+        .ok()
+        .filter(|l| l.is_tack() == crate::locker::is_tack())
 }
 
 pub fn save_last_good(flake: &Path, target: Option<&Target>, lock: &Lock) -> Result<()> {

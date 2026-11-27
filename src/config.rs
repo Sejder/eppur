@@ -60,6 +60,10 @@ pub struct Config {
     /// How many evaluations run at once.
     #[serde(default = "default_eval_jobs")]
     pub eval_jobs: usize,
+    /// What locks the flake's inputs: "auto" (tack when the flake has
+    /// .tack/pins.toml), "flake" or "tack".
+    #[serde(default)]
+    pub locker: crate::locker::Choice,
 }
 
 fn default_eval_jobs() -> usize {
